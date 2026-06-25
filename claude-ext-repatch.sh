@@ -56,10 +56,17 @@ let s = fs.readFileSync(FILE, "utf8");
 
 // Diff component name: function NAME({original:e,modified:t,language:i="plaintext",filePath:n})
 const diffFn = (s.match(/function ([A-Za-z0-9_$]+)\(\{original:e,modified:t,language:i="plaintext",filePath:n\}\)/) || [])[1];
-// Edit tool tag: createElement(<diffFn>,{original:t.old_string... is in the Edit body;
+// Edit tool tag: the Edit body renders the diff via <jsxHelper>(<diffFn>,{original:t.old_string...});
 // the Edit header is `name=<TAG>;header(e,t){return this.fileToolHeader(this.name,t.file_path,{searchText:t.new_string})}`
 const editHdr = s.match(/name=([A-Za-z0-9_$]+);header\(e,t\)\{return this\.fileToolHeader\(this\.name,t\.file_path,\{searchText:t\.new_string\}\)\}/);
 const editTag = editHdr ? editHdr[1] : null;
+// The diff component's click overlay calls a modal-open helper. Both the handler var and
+// the helper are minified and rename across releases (was `v=()=>{p(...)}` in older builds,
+// `C=()=>{p(...)}` in 2.1.191), so DISCOVER both instead of hardcoding. The destructured
+// arg shape {original:e,modified:t,language:i,filePath:n} is the stable anchor.
+const clickH = s.match(/([A-Za-z0-9_$]+)=\(\)=>\{([A-Za-z0-9_$]+)\(\{original:e,modified:t,language:i,filePath:n\}\)\}/);
+const clickVar = clickH ? clickH[1] : null;
+const modalFn  = clickH ? clickH[2] : null;
 
 const edits = [
   { name: "B1 fileOpener +openDiff",
@@ -70,14 +77,17 @@ const edits = [
     to:   `function ${diffFn}({original:e,modified:t,language:i="plaintext",filePath:n,onOpenFile:$openFn})` },
   // Overlay tries the native diff (returns a promise); on reject — which happens when
   // the edit is ALREADY applied and open_diff can't find old_string on disk — fall
-  // back to the original in-webview Monaco modal (p) instead of doing nothing.
-  { name: "B3 overlay -> onOpenFile + modal fallback",
-    from: `v=()=>{p({original:e,modified:t,language:i,filePath:n})}`,
-    to:   `v=()=>{let $m=()=>p({original:e,modified:t,language:i,filePath:n});if($openFn){let $r=$openFn();if($r&&$r.catch)$r.catch($m);else if(!$r)$m()}else $m()}` },
+  // back to the original in-webview Monaco modal (modalFn) instead of doing nothing.
+  clickVar && { name: "B3 overlay -> onOpenFile + modal fallback",
+    from: `${clickVar}=()=>{${modalFn}({original:e,modified:t,language:i,filePath:n})}`,
+    to:   `${clickVar}=()=>{let $m=()=>${modalFn}({original:e,modified:t,language:i,filePath:n});if($openFn){let $r=$openFn();if($r&&$r.catch)$r.catch($m);else if(!$r)$m()}else $m()}` },
   // Edit body returns the openDiff promise from onOpenFile so the overlay can catch.
+  // Anchor on `(<diffFn>,{...})` only — NOT the jsx helper before it. That helper used to
+  // be `createElement(` (React classic runtime) and is now `b(` (automatic jsx runtime);
+  // leaving it outside the anchor makes this robust to that structural compile change.
   diffFn && { name: "B4 Edit body -> native diff",
-    from: `createElement(${diffFn},{original:t.old_string||"",modified:t.new_string||"",filePath:t.file_path||""})`,
-    to:   `createElement(${diffFn},{original:t.old_string||"",modified:t.new_string||"",filePath:t.file_path||"",onOpenFile:()=>this.opener.openDiff?this.opener.openDiff(t.file_path,[{oldString:t.old_string||"",newString:t.new_string||"",replaceAll:!!t.replace_all}]):void 0})` },
+    from: `(${diffFn},{original:t.old_string||"",modified:t.new_string||"",filePath:t.file_path||""})`,
+    to:   `(${diffFn},{original:t.old_string||"",modified:t.new_string||"",filePath:t.file_path||"",onOpenFile:()=>this.opener.openDiff?this.opener.openDiff(t.file_path,[{oldString:t.old_string||"",newString:t.new_string||"",replaceAll:!!t.replace_all}]):void 0})` },
   // C: filename click jumps to the changed line. Target the EDIT tool's OWN header
   // (tag discovered above), NOT the generic shared header. Widen its existing
   // {searchText:t.new_string} to old_string||new_string so it works whether the edit
@@ -91,10 +101,12 @@ const edits = [
 // none (e.g. openDiff present but the diff component never receives onOpenFile -> the
 // click does nothing). If discovery fails or any anchor doesn't match exactly once,
 // we abort WITHOUT writing, leaving the pristine bundle (the caller already restored
-// it from .orig). Note: B1/B3 use generic anchors; B2/B4 need diffFn; C needs editTag.
+// it from .orig). Note: B1 uses a generic anchor; B2/B4 need diffFn; B3 needs clickVar;
+// C needs editTag.
 const failures = [];
-if (!diffFn)  failures.push("diff component not found (B2/B4)");
-if (!editTag) failures.push("Edit header not found (C)");
+if (!diffFn)   failures.push("diff component not found (B2/B4)");
+if (!editTag)  failures.push("Edit header not found (C)");
+if (!clickVar) failures.push("diff click overlay handler not found (B3)");
 
 let work = s;
 for (const e of edits) {
@@ -109,7 +121,7 @@ if (failures.length) {
 }
 
 fs.writeFileSync(FILE, work);
-console.log(`  JS:  ${edits.length}/${edits.length} edits applied [diff=${diffFn}, edit=${editTag}]`);
+console.log(`  JS:  ${edits.length}/${edits.length} edits applied [diff=${diffFn}, edit=${editTag}, click=${clickVar}->${modalFn}]`);
 NODE
 }
 
