@@ -31,6 +31,12 @@
 #           openDiff promise) into vXe.
 #   C (JS)  Clicking the Edit card's FILENAME opens the file at the changed line
 #           (Edit header passes {searchText:old_string||new_string}).
+#   D (HOST) Clicking a Write/new-file card opens its content in a separate editor
+#           tab with NO syntax highlighting. The host (extension.js) names that
+#           virtual doc `<fileName> (<rand>)`, so the path ends in e.g. `.php (a1b2c3)`
+#           -> no valid extension -> VS Code can't detect the language. Move the
+#           `(<rand>)` BEFORE the extension so highlighting works. This is the only
+#           fix to the HOST bundle (extension.js), not the webview bundle.
 #
 # Why local patches instead of waiting for upstream: the relevant GitHub issues
 # (#59305, #59078, #3143, #48258, #65311) were all auto-closed by
@@ -145,7 +151,7 @@ if (s.includes(marker)) {
 NODE
 }
 
-# Fix F (HOST bundle extension.js): syntax highlighting in the "open in editor"
+# Fix D (HOST bundle extension.js): syntax highlighting in the "open in editor"
 # view of a Write/new-file card. The host opens that view as a single read-only
 # doc whose virtual path is `/temp/readonly/<fileName> (<rand>)` — the disambiguator
 # is appended AFTER the extension, so the path ends in e.g. `.php (a1b2c3)` and VS
@@ -239,7 +245,7 @@ for d in "${dirs[@]}"; do
     echo "  syntax: OK"
   fi
 
-  # Fix F (host bundle) — independent of the webview patches above. Back up, re-derive
+  # Fix D (host bundle) — independent of the webview patches above. Back up, re-derive
   # from pristine, patch, verify it parses; roll back this file alone on any failure.
   if [ -f "$host" ]; then
     [ -f "$host.orig" ] || cp "$host" "$host.orig"

@@ -1,9 +1,9 @@
 # claude-code-vscode-ui-fixes
 
-Local patches for three diff/preview UX shortcomings in the **Claude Code VS Code extension**.
+Local patches for four diff/preview UX shortcomings in the **Claude Code VS Code extension**.
 
-These are applied to the extension's webview bundle on *your own machine*. The repo
-contains **only the patch script** — never any of Anthropic's code (see
+These are applied to the extension's bundles (webview + host) on *your own machine*.
+The repo contains **only the patch script** — never any of Anthropic's code (see
 [Legal](#legal)).
 
 ## The problems it fixes
@@ -15,6 +15,7 @@ When the Claude Code extension shows tool activity in its panel:
 | **A** | A **Write** (new file) preview is clipped to ~2–3 lines with no way to scroll. | Make the Write preview a scrollable, taller box. |
 | **B** | Clicking an **Edit** diff card shows a tiny in-panel diff with no surrounding context. | Clicking it now opens VS Code's **native diff** (real file ↔ file-with-edit), with full context and real line numbers. Falls back to the original in-panel diff if the edit is already applied. |
 | **C** | Clicking the Edit card's **filename** opens the file at line 1. | It now jumps to the changed line. |
+| **D** | Clicking a **Write** (new file) card opens its content in a separate editor tab with **no syntax highlighting** (everything is plain text). | The new file gets its real extension back so VS Code highlights it. |
 
 ### Why patch locally instead of waiting for upstream?
 
@@ -29,18 +30,26 @@ got human triage. Self-patching is currently the only reliable path.
 
 ## How it works
 
-The extension ships a **minified, closed-source** webview bundle
-(`webview/index.{js,css}`). Fix B reuses an RPC the extension **already implements**
-internally (`open_diff` → `vscode.diff`) but never wires to the diff card's click.
+The extension ships **minified, closed-source** bundles: the webview
+(`webview/index.{js,css}`, fixes A/B/C) and the extension host (`extension.js`,
+fix D). Fix B reuses an RPC the extension **already implements** internally
+(`open_diff` → `vscode.diff`) but never wires to the diff card's click. Fix D moves
+the random disambiguator the host appends to a new file's virtual name — from *after*
+the extension (`Foo.php (a1b2c3)`, which VS Code can't recognize) to *before* it
+(`Foo (a1b2c3).php`), so language detection — and therefore highlighting — kicks in.
 The script:
 
 - patches **only the highest-versioned** installed build;
-- keeps a one-time pristine backup (`index.js.orig` / `index.css.orig`);
-- always re-derives from that backup, so it's **idempotent**;
+- keeps a one-time pristine backup of each touched file (`index.js.orig`,
+  `index.css.orig`, `extension.js.orig`);
+- always re-derives from those backups, so it's **idempotent**;
 - matches code by unique anchor strings — if an anchor is missing (e.g. after a big
-  upstream rewrite) it **skips that fix and prints `SKIPPED`** rather than corrupting
-  the bundle;
-- verifies `node --check` and rolls the JS back if it somehow doesn't parse.
+  upstream rewrite) it **skips that fix and prints `ABORTED`/`SKIPPED`** rather than
+  corrupting the bundle;
+- treats the webview fixes (A/B/C) and the host fix (D) as **independent** — a
+  failure in one leaves the other applied;
+- verifies `node --check` on each patched JS bundle and rolls it back if it somehow
+  doesn't parse.
 
 ## Install
 
@@ -72,8 +81,8 @@ claude-ext-repatch.sh --if-needed  # only patch if not already patched (used by 
 ```
 
 Removes the login hook and the installed script. To drop the patches themselves,
-reinstall the extension (or restore each `webview/index.{js,css}.orig`) and reload
-VS Code.
+reinstall the extension (or restore each `webview/index.{js,css}.orig` and
+`extension.js.orig`) and reload VS Code.
 
 ## Limitations (honest)
 
