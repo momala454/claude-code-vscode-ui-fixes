@@ -145,6 +145,37 @@ if (s.includes(marker)) {
 NODE
 }
 
+# Fix F (HOST bundle extension.js): syntax highlighting in the "open in editor"
+# view of a Write/new-file card. The host opens that view as a single read-only
+# doc whose virtual path is `/temp/readonly/<fileName> (<rand>)` — the disambiguator
+# is appended AFTER the extension, so the path ends in e.g. `.php (a1b2c3)` and VS
+# Code can't detect the language -> plaintext, no colors. We move the `(<rand>)`
+# to BEFORE the extension (`<base> (<rand>).php`) so the path keeps a real
+# extension and language detection (hence highlighting) works again. Independent
+# of the webview patches A/B/C — patched/rolled back on its own.
+host_patch() {
+  FILE="$1" node - <<'NODE'
+const fs = require("fs");
+const FILE = process.env.FILE;
+let s = fs.readFileSync(FILE, "utf8");
+
+// The temp doc name is built once as: `${n||"Claude Code"} (${rand})`, where n is
+// the fileName. Replace that template literal with an IIFE that inserts the random
+// id before the file extension instead of after it. Names are $-prefixed to avoid
+// colliding with the minified single-letter locals (e,t,r,i,n,s,o,a,l,u,d,m,v,...).
+const from = '`${n||"Claude Code"} (${Math.random().toString(36).substring(2,8)})`';
+const to   = '(()=>{let $q=n||"Claude Code",$g=Math.random().toString(36).substring(2,8),$z=$q.lastIndexOf(".");return $z>0?$q.slice(0,$z)+" ("+$g+")"+$q.slice($z):$q+" ("+$g+")"})()';
+
+const n = s.split(from).length - 1;
+if (n !== 1) {
+  console.log(`  HOST: ABORTED, no changes written — anchor x${n} (bundle shape changed)`);
+  process.exit(3);
+}
+fs.writeFileSync(FILE, s.replace(from, to));
+console.log("  HOST: 1/1 edit applied [new-file view: id-before-extension]");
+NODE
+}
+
 shopt -s nullglob
 dirs=( $EXT_GLOB )
 shopt -u nullglob
@@ -159,29 +190,33 @@ for d in "${dirs[@]}"; do
   ver="$(basename "$d")"
   js="$d/webview/index.js"
   css="$d/webview/index.css"
+  host="$d/extension.js"
   [ -f "$js" ] && [ -f "$css" ] || { echo "-> $ver (no webview bundle, skipping)"; continue; }
 
   if [ "$d" != "$target" ]; then
     # Not the active build: restore pristine if we have backups, then leave it.
-    [ -f "$js.orig" ]  && cp "$js.orig"  "$js"
-    [ -f "$css.orig" ] && cp "$css.orig" "$css"
+    [ -f "$js.orig" ]   && cp "$js.orig"   "$js"
+    [ -f "$css.orig" ]  && cp "$css.orig"  "$css"
+    [ -f "$host.orig" ] && cp "$host.orig" "$host"
     echo "-> $ver (not active build; restored to pristine if patched)"
     continue
   fi
 
   # --if-needed: skip silently when the active build already carries our patches
-  # (avoids rewriting the bundle on every shell login). A patched bundle has the
-  # openDiff method AND the CSS marker; if both are present we're done.
+  # (avoids rewriting the bundle on every shell login). A fully patched install has
+  # the webview openDiff method, the CSS marker, AND the host new-file-view fix.
   if [ "${1:-}" = "--if-needed" ]; then
-    if grep -q 'openDiff:(e,t)=>' "$js" 2>/dev/null && grep -q 'write-preview-scroll' "$css" 2>/dev/null; then
+    if grep -q 'openDiff:(e,t)=>' "$js" 2>/dev/null \
+       && grep -q 'write-preview-scroll' "$css" 2>/dev/null \
+       && { [ ! -f "$host" ] || grep -qF '$q=n||"Claude Code"' "$host" 2>/dev/null; }; then
       exit 0
     fi
   fi
 
   echo "-> $ver (active build)"
   # One-time pristine backups, then re-derive from them so runs are idempotent.
-  [ -f "$js.orig" ]  || cp "$js"  "$js.orig"
-  [ -f "$css.orig" ] || cp "$css" "$css.orig"
+  [ -f "$js.orig" ]   || cp "$js"   "$js.orig"
+  [ -f "$css.orig" ]  || cp "$css"  "$css.orig"
   cp "$js.orig"  "$js"
   cp "$css.orig" "$css"
 
@@ -192,16 +227,36 @@ for d in "${dirs[@]}"; do
   js_patch "$js" || js_rc=$?
 
   if [ "$js_rc" -ne 0 ]; then
-    echo "  -> leaving bundle PRISTINE (JS patch aborted; CSS not applied)"
+    echo "  -> leaving webview bundle PRISTINE (JS patch aborted; CSS not applied)"
     cp "$js.orig"  "$js"
     cp "$css.orig" "$css"
   elif ! node --check "$js" 2>/dev/null; then
-    echo "  syntax: FAILED -> rolling back BOTH files to pristine"
+    echo "  syntax: FAILED -> rolling back BOTH webview files to pristine"
     cp "$js.orig"  "$js"
     cp "$css.orig" "$css"
   else
     css_patch "$css"
     echo "  syntax: OK"
+  fi
+
+  # Fix F (host bundle) — independent of the webview patches above. Back up, re-derive
+  # from pristine, patch, verify it parses; roll back this file alone on any failure.
+  if [ -f "$host" ]; then
+    [ -f "$host.orig" ] || cp "$host" "$host.orig"
+    cp "$host.orig" "$host"
+    host_rc=0
+    host_patch "$host" || host_rc=$?
+    if [ "$host_rc" -ne 0 ]; then
+      echo "  -> leaving host bundle PRISTINE (HOST patch aborted)"
+      cp "$host.orig" "$host"
+    elif ! node --check "$host" 2>/dev/null; then
+      echo "  host syntax: FAILED -> rolling back extension.js to pristine"
+      cp "$host.orig" "$host"
+    else
+      echo "  host syntax: OK"
+    fi
+  else
+    echo "  HOST: extension.js not found, SKIPPED"
   fi
 done
 
