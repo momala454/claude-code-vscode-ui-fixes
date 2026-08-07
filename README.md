@@ -43,9 +43,12 @@ The script:
 - keeps a one-time pristine backup of each touched file (`index.js.orig`,
   `index.css.orig`, `extension.js.orig`);
 - always re-derives from those backups, so it's **idempotent**;
-- matches code by unique anchor strings — if an anchor is missing (e.g. after a big
-  upstream rewrite) it **skips that fix and prints `ABORTED`/`SKIPPED`** rather than
-  corrupting the bundle;
+- locates code by **structural** anchors: every name the minifier controls (component
+  names, tool tags, handler vars, the short `e,t,i,n` locals) and every CSS-module class
+  hash is *discovered* from the bundle, never written into the anchor — only source-level
+  names (`original:`, `filePath:`, `old_string`, `openContent`, `"Write"`, …) are matched
+  literally. If an anchor is missing or ambiguous (e.g. after a big upstream rewrite) it
+  **skips that fix and prints `ABORTED`/`SKIPPED`** rather than corrupting the bundle;
 - treats the webview fixes (A/B/C) and the host fix (D) as **independent** — a
   failure in one leaves the other applied;
 - verifies `node --check` on each patched JS bundle and rolls it back if it somehow
