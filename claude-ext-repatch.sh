@@ -30,13 +30,19 @@
 #           webview fileOpener and threads an onOpenFile callback (returning the
 #           openDiff promise) into vXe.
 #   C (JS)  Clicking the Edit card's FILENAME opens the file at the changed line
-#           (Edit header passes {searchText:old_string||new_string}).
+#           (Edit header passes {searchText:new_string||old_string, searchTextAlt:old_string}).
 #   D (HOST) Clicking a Write/new-file card opens its content in a separate editor
 #           tab with NO syntax highlighting. The host (extension.js) names that
 #           virtual doc `<fileName> (<rand>)`, so the path ends in e.g. `.php (a1b2c3)`
 #           -> no valid extension -> VS Code can't detect the language. Move the
-#           `(<rand>)` BEFORE the extension so highlighting works. This is the only
-#           fix to the HOST bundle (extension.js), not the webview bundle.
+#           `(<rand>)` BEFORE the extension so highlighting works.
+#   E (HOST) The filename click (fix C) landed on line 1 instead of the edit. The host
+#           resolves {searchText} with a single plain indexOf and does NOTHING when it
+#           misses — and it missed constantly, because fix C sent old_string first, the
+#           one text that is GONE from the file once the edit is applied. Now openFile
+#           tries searchText then searchTextAlt, then falls back to the longest non-blank
+#           line of the edit matched on trimmed document lines (so it still lands after
+#           the file has been reformatted or re-edited). D and E are applied independently.
 #
 # Why local patches instead of waiting for upstream: the relevant GitHub issues
 # (#59305, #59078, #3143, #48258, #65311) were all auto-closed by
@@ -105,12 +111,14 @@ const edits = [
     from: bodyM[0],
     to:   bodyM[0].slice(0, -2) + `,onOpenFile:()=>this.opener.openDiff?this.opener.openDiff(${bodyM[1]}.file_path,[{oldString:${bodyM[1]}.old_string||"",newString:${bodyM[1]}.new_string||"",replaceAll:!!${bodyM[1]}.replace_all}]):void 0})` },
   // C: filename click jumps to the changed line. Target the EDIT tool's OWN header
-  // (tag discovered above), NOT the generic shared header. Widen its existing
-  // {searchText:t.new_string} to old_string||new_string so it works whether the edit
-  // is pending (old_string in file) or applied (new_string in file).
+  // (tag discovered above), NOT the generic shared header. Send BOTH sides of the edit:
+  // the host does a plain indexOf and does nothing at all when it misses, so the primary
+  // must be the text that is actually IN the file at click time. That is new_string --
+  // by the time you click a card, the edit is normally already applied; old_string only
+  // still exists while the edit is pending, so it is the fallback (see fix E, host side).
   editHdr && { name: "C  Edit header -> jump to changed line",
     from: editHdr[0],
-    to:   `name=${editTag};header(${editHdr[2]},${editHdr[3]}){return this.fileToolHeader(this.name,${editHdr[3]}.file_path,{searchText:${editHdr[3]}.old_string||${editHdr[3]}.new_string})}` },
+    to:   `name=${editTag};header(${editHdr[2]},${editHdr[3]}){return this.fileToolHeader(this.name,${editHdr[3]}.file_path,{searchText:${editHdr[3]}.new_string||${editHdr[3]}.old_string,searchTextAlt:${editHdr[3]}.old_string||""})}` },
 ].filter(Boolean);
 
 // ALL-OR-NOTHING: every expected edit must apply. A partial JS patch is worse than
@@ -164,7 +172,13 @@ const marker = "/* claude-ext-repatch: write-preview-scroll */";
 const js  = fs.readFileSync(process.env.JSFILE, "utf8");
 const row = s.match(/\.(toolBodyRowContent_[\w-]+):not\([^)]*\)\{[^}]*max-height:60px[^}]*\}/);
 const tag = js.match(/([A-Za-z0-9_$]+)="Write"/);
-const wrap = tag ? js.match(new RegExp(`\\{toolBodyWrapper:"(toolBodyWrapper_[\\w-]+)"\\};class [A-Za-z0-9_$]+ extends [A-Za-z0-9_$]+\\{static toolName=${tag[1].replace(/\$/g, "\\$")};`)) : null;
+// Follow the DATA dependency rather than textual adjacency: the Write class body renders
+// `className:`...${<styleVar>.toolBodyWrapper}`` -> then resolve that var's hash. Anchoring
+// on "style object immediately followed by the class" broke on 2.1.267, which inserts a
+// `k();` call between the two.
+const esc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, (c) => "\\" + c);
+const body = tag ? js.match(new RegExp(`class [A-Za-z0-9_$]+ extends [A-Za-z0-9_$]+\\{static toolName=${esc(tag[1])};[\\s\\S]{0,2000}?\\$\\{([A-Za-z0-9_$]+)\\.toolBodyWrapper\\}`)) : null;
+const wrap = body ? js.match(new RegExp(`${esc(body[1])}=\\{toolBodyWrapper:"(toolBodyWrapper_[\\w-]+)"\\}`)) : null;
 if (s.includes(marker)) {
   console.log("  CSS: already present");
 } else if (!row || !wrap) {
@@ -192,6 +206,7 @@ host_patch() {
 const fs = require("fs");
 const FILE = process.env.FILE;
 let s = fs.readFileSync(FILE, "utf8");
+const ID = "[A-Za-z0-9_$]+";
 
 // The temp doc name is built once as: `${<fileName>||"Claude Code"} (${rand})`. The local
 // holding the fileName is minified, so it is DISCOVERED, never hardcoded: it was `n` on
@@ -204,12 +219,56 @@ const from = m ? m[0] : null;
 const to   = m ? `(()=>{let $q=${m[1]}||"Claude Code",$g=Math.random().toString(36).substring(2,8),$z=$q.lastIndexOf(".");return $z>0?$q.slice(0,$z)+" ("+$g+")"+$q.slice($z):$q+" ("+$g+")"})()` : null;
 
 const n = from === null ? 0 : s.split(from).length - 1;
-if (n !== 1) {
-  console.log(`  HOST: ABORTED, no changes written — anchor x${n} (bundle shape changed)`);
+
+// Fix E (host): make openFile actually land on the edit. The host resolves a card's
+// {searchText} with ONE plain indexOf and, when it misses, silently does nothing — the
+// file just opens at line 1, which is the whole "I can't tell where the change was"
+// symptom. Fix C now sends new_string as searchText plus old_string as searchTextAlt, so
+// here we (1) try each candidate in turn, and (2) if neither survived verbatim (file
+// reformatted or re-edited since the card was produced), fall back to the longest
+// non-blank line of the edit matched against trimmed document lines. Only the reveal is
+// rewritten; the `heading` and `startLine` branches after it are untouched.
+// Every minified local is a capture group: 1=location, 2=document, 3=editor, 4=index,
+// 5/6=positions, 7=range, 8=the vscode namespace.
+const e = s.match(new RegExp(
+  `if\\((${ID})\\?\\.searchText\\)\\{let (${ID})=(${ID})\\.document,(${ID})=\\2\\.getText\\(\\)\\.indexOf\\(\\1\\.searchText\\);`
+  + `if\\(\\4!==-1\\)\\{let (${ID})=\\2\\.positionAt\\(\\4\\),(${ID})=\\2\\.positionAt\\(\\4\\+\\1\\.searchText\\.length\\),`
+  + `(${ID})=new (${ID})\\.Range\\(\\5,\\6\\);\\3\\.revealRange\\(\\7,\\8\\.TextEditorRevealType\\.InCenter\\),`
+  + `\\3\\.selection=new \\8\\.Selection\\(\\5,\\6\\)\\}\\}`));
+const eFrom = e ? e[0] : null;
+const eTo = e === null ? null : (() => {
+  const [, loc, , ed, , , , , ns] = e;
+  return `if(${loc}?.searchText){let $ed=${ed},$doc=$ed.document,$txt=$doc.getText(),$at=-1,$len=0;`
+    + `for(let $s of [${loc}.searchText,${loc}.searchTextAlt]){if(typeof $s!="string"||$s.length===0)continue;`
+    + `let $i=$txt.indexOf($s);if($i!==-1){$at=$i,$len=$s.length;break}}`
+    + `if($at===-1){let $c=[];for(let $s of [${loc}.searchText,${loc}.searchTextAlt]){`
+    + `if(typeof $s=="string")for(let $l of $s.split("\\n")){let $t=$l.trim();if($t.length>=8)$c.push($t)}}`
+    + `$c.sort(($a,$b)=>$b.length-$a.length);`
+    + `for(let $t of $c){for(let $i=0;$i<$doc.lineCount;$i++){let $l=$doc.lineAt($i).text;`
+    + `if($l.trim()===$t){$at=$doc.offsetAt(new ${ns}.Position($i,0)),$len=$l.length;break}}if($at!==-1)break}}`
+    + `if($at!==-1){let $p=$doc.positionAt($at),$q=$doc.positionAt($at+$len),$r=new ${ns}.Range($p,$q);`
+    + `$ed.revealRange($r,${ns}.TextEditorRevealType.InCenter),$ed.selection=new ${ns}.Selection($p,$q)}}`;
+})();
+const eN = eFrom === null ? 0 : s.split(eFrom).length - 1;
+
+// D and E are INDEPENDENT (different functions, no shared injected symbol), so each is
+// applied or skipped on its own: a future build breaking E's anchor must not also cost us
+// D's highlighting. E also degrades on its own — without it the host still honours the
+// new_string that fix C sends as searchText, it just loses the fallbacks.
+if (n !== 1 && eN !== 1) {
+  console.log(`  HOST: ABORTED, no changes written — anchors D x${n} / E x${eN} (bundle shape changed)`);
   process.exit(3);
 }
-fs.writeFileSync(FILE, s.replace(from, () => to));
-console.log(`  HOST: 1/1 edit applied [new-file view: id-before-extension, fileName=${m[1]}]`);
+
+let work = s;
+const applied = [];
+if (n === 1) { work = work.replace(from, () => to); applied.push(`D new-file view [fileName=${m[1]}]`); }
+else { console.log(`  HOST: D SKIPPED — anchor x${n} (new-file view highlighting)`); }
+if (eN === 1) { work = work.replace(eFrom, () => eTo); applied.push(`E openFile jump [loc=${e[1]}, ns=${e[8]}]`); }
+else { console.log(`  HOST: E SKIPPED — anchor x${eN} (openFile jump-to-edit)`); }
+
+fs.writeFileSync(FILE, work);
+console.log(`  HOST: ${applied.length}/2 edits applied — ${applied.join("; ")}`);
 NODE
 }
 
@@ -247,7 +306,8 @@ for d in "${dirs[@]}"; do
   if [ "${1:-}" = "--if-needed" ]; then
     if grep -qF 'openDiff:($a,$b)=>' "$js" 2>/dev/null \
        && grep -qF 'write-preview-scroll' "$css" 2>/dev/null \
-       && { [ ! -f "$host" ] || grep -qF '$z=$q.lastIndexOf(".")' "$host" 2>/dev/null; }; then
+       && { [ ! -f "$host" ] || grep -qF '$z=$q.lastIndexOf(".")' "$host" 2>/dev/null; } \
+       && { [ ! -f "$host" ] || grep -qF '$at=$doc.offsetAt(new' "$host" 2>/dev/null; }; then
       exit 0
     fi
   fi

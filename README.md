@@ -1,6 +1,6 @@
 # claude-code-vscode-ui-fixes
 
-Local patches for four diff/preview UX shortcomings in the **Claude Code VS Code extension**.
+Local patches for five diff/preview UX shortcomings in the **Claude Code VS Code extension**.
 
 These are applied to the extension's bundles (webview + host) on *your own machine*.
 The repo contains **only the patch script** — never any of Anthropic's code (see
@@ -14,8 +14,9 @@ When the Claude Code extension shows tool activity in its panel:
 |---|---------|-----|
 | **A** | A **Write** (new file) preview is clipped to ~2–3 lines with no way to scroll. | Make the Write preview a scrollable, taller box. |
 | **B** | Clicking an **Edit** diff card shows a tiny in-panel diff with no surrounding context. | Clicking it now opens VS Code's **native diff** (real file ↔ file-with-edit), with full context and real line numbers. Falls back to the original in-panel diff if the edit is already applied. |
-| **C** | Clicking the Edit card's **filename** opens the file at line 1. | It now jumps to the changed line. |
+| **C** | Clicking the Edit card's **filename** opens the file at line 1. | The card now sends both sides of the edit, so the jump targets the text that is actually in the file. |
 | **D** | Clicking a **Write** (new file) card opens its content in a separate editor tab with **no syntax highlighting** (everything is plain text). | The new file gets its real extension back so VS Code highlights it. |
+| **E** | …and that filename jump still landed on line 1 anyway: the host looks the text up with a single exact match and does **nothing at all** when it misses — which is most of the time, since the card's "before" text is gone from the file as soon as the edit is applied. | The host now tries both sides of the edit, then falls back to matching the edit's most distinctive line ignoring indentation, so it still lands after the file has been reformatted or re-edited. |
 
 ### Why patch locally instead of waiting for upstream?
 
@@ -32,11 +33,13 @@ got human triage. Self-patching is currently the only reliable path.
 
 The extension ships **minified, closed-source** bundles: the webview
 (`webview/index.{js,css}`, fixes A/B/C) and the extension host (`extension.js`,
-fix D). Fix B reuses an RPC the extension **already implements** internally
+fixes D/E). Fix B reuses an RPC the extension **already implements** internally
 (`open_diff` → `vscode.diff`) but never wires to the diff card's click. Fix D moves
 the random disambiguator the host appends to a new file's virtual name — from *after*
 the extension (`Foo.php (a1b2c3)`, which VS Code can't recognize) to *before* it
 (`Foo (a1b2c3).php`), so language detection — and therefore highlighting — kicks in.
+Fix E rewrites the host's "reveal this text" step, which the filename click (fix C)
+depends on; D and E are applied independently, so one broken anchor can't cost the other.
 The script:
 
 - patches **only the highest-versioned** installed build;
