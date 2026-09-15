@@ -1,6 +1,6 @@
 # claude-code-vscode-ui-fixes
 
-Local patches for five diff/preview UX shortcomings in the **Claude Code VS Code extension**.
+Local patches for six UX shortcomings in the **Claude Code VS Code extension**.
 
 These are applied to the extension's bundles (webview + host) on *your own machine*.
 The repo contains **only the patch script** — never any of Anthropic's code (see
@@ -17,6 +17,7 @@ When the Claude Code extension shows tool activity in its panel:
 | **C** | Clicking the Edit card's **filename** opens the file at line 1. | The card now sends both sides of the edit, so the jump targets the text that is actually in the file. |
 | **D** | Clicking a **Write** (new file) card opens its content in a separate editor tab with **no syntax highlighting** (everything is plain text). | The new file gets its real extension back so VS Code highlights it. |
 | **E** | …and that filename jump still landed on line 1 anyway: the host looks the text up with a single exact match and does **nothing at all** when it misses — which is most of the time, since the card's "before" text is gone from the file as soon as the edit is applied. | The host now tries both sides of the edit, then falls back to matching the edit's most distinctive line ignoring indentation, so it still lands after the file has been reformatted or re-edited. |
+| **F** | Clicking **"Show more"** on a long message makes it cover the whole rest of the transcript — pinned to the top of the panel, hiding everything after it until you click "Show less" again. A message is a *sticky* header (so you keep seeing your question), and expanding it removes its height cap, so it grows past the viewport while staying pinned. | The message stops being sticky while it is expanded, so the rest of the transcript simply comes after it and you scroll past it normally. |
 
 ### Why patch locally instead of waiting for upstream?
 
@@ -32,7 +33,7 @@ got human triage. Self-patching is currently the only reliable path.
 ## How it works
 
 The extension ships **minified, closed-source** bundles: the webview
-(`webview/index.{js,css}`, fixes A/B/C) and the extension host (`extension.js`,
+(`webview/index.{js,css}`, fixes A/B/C/F) and the extension host (`extension.js`,
 fixes D/E). Fix B reuses an RPC the extension **already implements** internally
 (`open_diff` → `vscode.diff`) but never wires to the diff card's click. Fix D moves
 the random disambiguator the host appends to a new file's virtual name — from *after*

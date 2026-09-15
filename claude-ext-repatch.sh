@@ -36,6 +36,11 @@
 #           virtual doc `<fileName> (<rand>)`, so the path ends in e.g. `.php (a1b2c3)`
 #           -> no valid extension -> VS Code can't detect the language. Move the
 #           `(<rand>)` BEFORE the extension so highlighting works.
+#   F (CSS) A user message is a sticky header, which is fine collapsed — but "Show more"
+#           removes its height cap entirely, so the message grows past the viewport while
+#           STAYING pinned, painting over every following message until you collapse it
+#           again. Un-stick it only while expanded, so the rest of the transcript sits
+#           after it in normal flow. Upstream, nothing to do with the other fixes.
 #   E (HOST) The filename click (fix C) landed on line 1 instead of the edit. The host
 #           resolves {searchText} with a single plain indexOf and does NOTHING when it
 #           misses — and it missed constantly, because fix C sent old_string first, the
@@ -179,17 +184,49 @@ const tag = js.match(/([A-Za-z0-9_$]+)="Write"/);
 const esc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, (c) => "\\" + c);
 const body = tag ? js.match(new RegExp(`class [A-Za-z0-9_$]+ extends [A-Za-z0-9_$]+\\{static toolName=${esc(tag[1])};[\\s\\S]{0,2000}?\\$\\{([A-Za-z0-9_$]+)\\.toolBodyWrapper\\}`)) : null;
 const wrap = body ? js.match(new RegExp(`${esc(body[1])}=\\{toolBodyWrapper:"(toolBodyWrapper_[\\w-]+)"\\}`)) : null;
-if (s.includes(marker)) {
-  console.log("  CSS: already present");
+// A and F are independent blocks with their own marker, accumulated then written once.
+let out = s;
+const notes = [];
+
+if (out.includes(marker)) {
+  notes.push("A already present");
 } else if (!row || !wrap) {
-  console.log(`  CSS: SKIPPED — ${!row ? "clipped preview rule" : "Write tool wrapper class"} not found`);
+  notes.push(`A SKIPPED — ${!row ? "clipped preview rule" : "Write tool wrapper class"} not found`);
 } else {
-  const css = marker +
+  out += marker +
     `.${wrap[1]} .${row[1]}{mask-image:none;overflow:auto;max-height:240px;}` +
     `.${wrap[1]} .${row[1]} pre{overflow:visible;}`;
-  fs.writeFileSync(FILE, s + css);
-  console.log(`  CSS: write-preview-scroll appended [wrap=${wrap[1]}, row=${row[1]}]`);
+  notes.push(`A appended [wrap=${wrap[1]}, row=${row[1]}]`);
 }
+
+// Fix F: a user message is a STICKY header (position:sticky; top:0; z-index:2) so you can
+// still see your question while reading the answer. Harmless while the message is
+// collapsed; but "Show more" drops the height cap entirely (the component sets no
+// max-height when expanded), so the message becomes taller than the viewport AND stays
+// pinned — it then paints over every following message and nothing after it is reachable
+// until you collapse again. Un-stick it exactly while it is expanded: the "Show less"
+// button only exists in the DOM in that state, so `:has()` on it is a precise flag. The
+// expanded message then sits in normal flow and the rest of the transcript comes AFTER it,
+// which is the point — no height cap, no inner scrollbar. Collapsed, it stays sticky.
+// `:has()` is already used 16x by upstream's own CSS here, so support is not a question.
+// Both hashes are discovered: the sticky one from the CSS rule that must really be
+// position:sticky (self-validating), the button from the expandable module's own object,
+// with a backreference so both keys have to share one hash.
+const markerF = "/* claude-ext-repatch: expanded-message-unstick */";
+const sticky = [...new Set([...out.matchAll(/\.stickyHeader_([\w-]+)\{[^}]*position:sticky[^}]*\}/g)].map((m) => m[1]))];
+const exp = js.match(/\{expandableContainer:"expandableContainer_([\w-]+)"[^{}]*collapseButton:"collapseButton_\1"\}/);
+
+if (out.includes(markerF)) {
+  notes.push("F already present");
+} else if (sticky.length !== 1 || !exp) {
+  notes.push(`F SKIPPED — ${sticky.length !== 1 ? `sticky message rule x${sticky.length}` : "expandable module"} not found`);
+} else {
+  out += markerF + `.stickyHeader_${sticky[0]}:has(.collapseButton_${exp[1]}){position:static;}`;
+  notes.push(`F appended [sticky=stickyHeader_${sticky[0]}, button=collapseButton_${exp[1]}]`);
+}
+
+if (out !== s) fs.writeFileSync(FILE, out);
+console.log(`  CSS: ${notes.join("; ")}`);
 NODE
 }
 
@@ -306,6 +343,7 @@ for d in "${dirs[@]}"; do
   if [ "${1:-}" = "--if-needed" ]; then
     if grep -qF 'openDiff:($a,$b)=>' "$js" 2>/dev/null \
        && grep -qF 'write-preview-scroll' "$css" 2>/dev/null \
+       && grep -qF 'expanded-message-unstick' "$css" 2>/dev/null \
        && { [ ! -f "$host" ] || grep -qF '$z=$q.lastIndexOf(".")' "$host" 2>/dev/null; } \
        && { [ ! -f "$host" ] || grep -qF '$at=$doc.offsetAt(new' "$host" 2>/dev/null; }; then
       exit 0
