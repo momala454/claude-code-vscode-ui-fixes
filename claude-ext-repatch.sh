@@ -48,6 +48,14 @@
 #           tries searchText then searchTextAlt, then falls back to the longest non-blank
 #           line of the edit matched on trimmed document lines (so it still lands after
 #           the file has been reformatted or re-edited). D and E are applied independently.
+#   G (HOST) Fix B's native diff never worked on an ALREADY-APPLIED edit — i.e. on most
+#           cards you click. The host builds the diff's right-hand side by re-applying the
+#           edit to the file on disk, so once the edit is in, old_string is gone, the apply
+#           throws "String not found in file" and the click falls back to the small in-panel
+#           diff. For a card click the diff that matters is "file before the edit" vs "file
+#           as it is now", so reconstruct the before-content by applying the edit REVERSED
+#           and diff that against the real file. Opt-in via a marker diffToken sent by B1,
+#           so the CLI's own open_diff keeps failing as before (it relies on that error).
 #
 # Why local patches instead of waiting for upstream: the relevant GitHub issues
 # (#59305, #59078, #3143, #48258, #65311) were all auto-closed by
@@ -95,10 +103,33 @@ const clickH = s.match(new RegExp(`(${ID})=\\(\\)=>\\{(${ID})\\(\\{original:(${I
 const clickVar = clickH ? clickH[1] : null;
 const modalFn  = clickH ? clickH[2] : null;
 
+// The connection's openDiff takes POSITIONAL arguments, and we need to pass a diffToken in
+// the right slot (see fix G, host side) — so the POSITIONS are discovered too, not assumed:
+// read the client method's signature and map each request key back to the parameter index it
+// comes from. Hardcoding "the 7th argument" is the same mistake as hardcoding a minified
+// name, just one level up. If this shape ever changes we fall back to the plain 4-argument
+// call: fix B keeps working, only G's already-applied case goes back to the in-panel diff.
+const clientM = s.match(new RegExp(`async openDiff\\(((?:${ID},){0,12}${ID})\\)\\{return\\(await this\\.sendRequest\\(\\{type:"open_diff",originalFilePath:(${ID}),newFilePath:(${ID}),edits:(${ID}),supportMultiEdits:(${ID}),channelId:(${ID}),diffToken:(${ID})\\}`));
+const openDiffCall = (() => {
+  if (!clientM) return null;
+  const params = clientM[1].split(",");
+  const idx = [2, 3, 4, 5, 7].map((i) => params.indexOf(clientM[i]));
+  if (idx.includes(-1)) return null;
+  const args = new Array(Math.max(...idx) + 1).fill("void 0");
+  const [iOrig, iNew, iEdits, iMulti, iToken] = idx;
+  args[iOrig] = "$a"; args[iNew] = "$a"; args[iEdits] = "$b"; args[iMulti] = "!1";
+  args[iToken] = '"claude-ext-repatch:applied-edit"';
+  return `$c.openDiff(${args.join(",")})`;
+})();
+
 const edits = [
+  // The marker goes in the diffToken slot. It carries no meaning to upstream (an unknown
+  // token only ever makes a later accept_diff return false, and we never send one), but it
+  // lets host fix G recognise a click coming from a card and show the before/after diff of
+  // an already-applied edit. Without G the marker is simply ignored.
   openerM && { name: "B1 fileOpener +openDiff",
     from: openerM[0],
-    to:   openerM[0].replace(/\}\};startNewConversationTab$/, () => `},openDiff:($a,$b)=>{let $c=this.comms.connection.value;if($c)return $c.openDiff($a,$a,$b,!1);return Promise.reject(Error("no connection"))}};startNewConversationTab`) },
+    to:   openerM[0].replace(/\}\};startNewConversationTab$/, () => `},openDiff:($a,$b)=>{let $c=this.comms.connection.value;if($c)return ${openDiffCall || "$c.openDiff($a,$a,$b,!1)"};return Promise.reject(Error("no connection"))}};startNewConversationTab`) },
   diffM && { name: "B2 diff component +onOpenFile",
     from: diffM[0],
     to:   diffM[0].slice(0, -2) + ",onOpenFile:$openFn})" },
@@ -159,7 +190,8 @@ if (failures.length) {
 }
 
 fs.writeFileSync(FILE, work);
-console.log(`  JS:  ${edits.length}/${edits.length} edits applied [diff=${diffFn}, edit=${editTag}, click=${clickVar}->${modalFn}]`);
+console.log(`  JS:  ${edits.length}/${edits.length} edits applied [diff=${diffFn}, edit=${editTag}, click=${clickVar}->${modalFn}]`
+  + (openDiffCall ? "" : "\n  JS:  note — openDiff client signature not recognised, marker not sent (host fix G will stay idle)"));
 NODE
 }
 
@@ -288,12 +320,75 @@ const eTo = e === null ? null : (() => {
 })();
 const eN = eFrom === null ? 0 : s.split(eFrom).length - 1;
 
-// D and E are INDEPENDENT (different functions, no shared injected symbol), so each is
-// applied or skipped on its own: a future build breaking E's anchor must not also cost us
-// D's highlighting. E also degrades on its own — without it the host still honours the
-// new_string that fix C sends as searchText, it just loses the fallbacks.
-if (n !== 1 && eN !== 1) {
-  console.log(`  HOST: ABORTED, no changes written — anchors D x${n} / E x${eN} (bundle shape changed)`);
+// Fix G (host): make the native diff (fix B) work on an ALREADY-APPLIED edit. The host
+// builds the right-hand side by re-applying the edit to the file on disk — fine for a
+// PENDING edit, impossible once the edit is in the file: old_string is gone, the apply
+// throws "String not found in file" and the webview falls back to the in-panel diff. (In
+// the rarer case where new_string still contains old_string verbatim, the apply does not
+// throw and produces a DOUBLE-applied right-hand side — a diff of a file that never
+// existed.) For a card click the diff that matters is "before the edit" vs "as it is now",
+// so: reconstruct the before-content by applying the edit REVERSED, and prove it really is
+// the before-state by re-applying the edit forward and demanding the current file back
+// verbatim (that round-trip is what tells an applied edit from a merely similar pending
+// one). Then diff it against the REAL file, so the right-hand side has the file's own line
+// numbers. Strictly opt-in on the marker diffToken B1 sends: the CLI's own open_diff calls
+// keep throwing exactly as today, because the CLI needs that error.
+//
+// The anchor is the whole prologue of the diff helper, from its signature through the
+// apply call. Every name in it is minified — the 12 parameters included — so all of them
+// are capture groups; only the source-level literals ("/", the ✻ title, the log strings,
+// .Uri.file, "utf8", "leftTempFileProvider.createFile") are matched literally. That span
+// is also what makes the match self-validating: it pins each parameter to its position.
+// 1=fn, 2..13=params (output, leftProvider, rightProvider, originalFilePath, newFilePath,
+// edits, supportMultiEdits, acceptEvent, abortSignal, panelRegistry, channelId, diffToken),
+// 14/15=basenames, 16=title, 17=left uri, 18=vscode ns, 19=left content, 20=doc, 21=fs,
+// 22=catch arg, 23=applied content, 24=the apply function.
+const MARK = "claude-ext-repatch:applied-edit";
+const g = s.match(new RegExp(
+  `async function (${ID})\\((${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID})\\)\\{`
+  + `let (${ID})=\\5\\.split\\("/"\\)\\.pop\\(\\)\\|\\|\\5,(${ID})=\\6\\.split\\("/"\\)\\.pop\\(\\)\\|\\|\\6,`
+  + `(${ID})=\`✻ \\[Claude Code\\] \\$\\{\\14===\\15\\?\\14:\`\\$\\{\\14\\} → \\$\\{\\15\\}\`\\}\`;`
+  + `\\2\\.info\\("diff from",\\5,"to",\\6,"as",\\16\\);`
+  + `let (${ID})=(${ID})\\.Uri\\.file\\(\\5\\),(${ID})="";`
+  + `try\\{let (${ID})=await \\18\\.workspace\\.openTextDocument\\(\\17\\);`
+  + `if\\(\\20\\.isDirty\\)\\19=(${ID})\\.readFileSync\\(\\5,"utf8"\\),\\17=\\3\\.createFile\\(\\5,\\19\\)\\.uri;`
+  + `else \\19=\\20\\.getText\\(\\)\\}`
+  + `catch\\((${ID})\\)\\{\\2\\.info\\("leftTempFileProvider\\.createFile",\\5\\),\\17=\\3\\.createFile\\(\\5,""\\)\\.uri\\}`
+  + `let (${ID})=(${ID})\\(\\19,\\7\\),`));
+// The call site proves the first three arguments really are output/left/right provider,
+// hence that the positional reading of the other nine holds. If the shapes ever disagree,
+// skip G rather than inject code reading the wrong parameters.
+const gTail = g ? `let ${g[23]}=${g[24]}(${g[19]},${g[7]}),` : null;
+const gOk = !!g && s.includes(`${g[1]}(this.output,this.leftTempFileProvider,this.rightTempFileProvider,`) && g[0].endsWith(gTail);
+const gFrom = gOk ? g[0] : null;
+const gTo = gFrom === null ? null : (() => {
+  const [, , , lprov, , opath, , edits, , , , , , tok, , , title, , ns, lcontent] = g;
+  // $b = the reconstructed before-content; left pane = a temp doc keyed on the real path
+  // (so it keeps the extension, hence the highlighting), right pane = the file itself.
+  // Then put the cursor on the first line that differs, so a 2000-line file does not open
+  // at line 1 — same intent as fix E, and a no-op if the diff editor already got there.
+  const inj = `if(${tok}===${JSON.stringify(MARK)}){`
+    + `let $r=[...${edits}].reverse().map(($x)=>({oldString:$x.newString,newString:$x.oldString,replaceAll:$x.replaceAll})),$b=null;`
+    + `try{$b=${g[24]}(${lcontent},$r)}catch{}`
+    + `if($b!==null&&$b!==${lcontent}){let $ok=!1;try{$ok=${g[24]}($b,${edits})===${lcontent}}catch{}`
+    + `if($ok){let $lu=${lprov}.createFile(${opath},$b).uri;`
+    + `await ${ns}.commands.executeCommand("vscode.diff",$lu,${ns}.Uri.file(${opath}),${title}+" (before ↔ current)",{preview:!1});`
+    + `try{let $k=0;while($k<$b.length&&$k<${lcontent}.length&&$b.charCodeAt($k)===${lcontent}.charCodeAt($k))$k++;`
+    + `let $ln=${lcontent}.slice(0,$k).split("\\n").length-1,$te=${ns}.window.activeTextEditor;`
+    + `if($te&&$te.document.uri.fsPath===${opath}){let $pp=new ${ns}.Position($ln,0),$rr=new ${ns}.Range($pp,$pp);`
+    + `$te.revealRange($rr,${ns}.TextEditorRevealType.InCenter),$te.selection=new ${ns}.Selection($pp,$pp)}}catch{}`
+    + `return}}}`;
+  return gFrom.slice(0, gFrom.length - gTail.length) + inj + gTail;
+})();
+const gN = gFrom === null ? 0 : s.split(gFrom).length - 1;
+
+// D, E and G are INDEPENDENT (different functions, no shared injected symbol), so each is
+// applied or skipped on its own: a future build breaking one anchor must not also cost the
+// others. Each also degrades gracefully — without E the host still honours the new_string
+// that fix C sends as searchText, it just loses the fallbacks; without G a card click on an
+// applied edit falls back to the in-panel diff, as it did before G existed.
+if (n !== 1 && eN !== 1 && gN !== 1) {
+  console.log(`  HOST: ABORTED, no changes written — anchors D x${n} / E x${eN} / G x${gN} (bundle shape changed)`);
   process.exit(3);
 }
 
@@ -303,9 +398,11 @@ if (n === 1) { work = work.replace(from, () => to); applied.push(`D new-file vie
 else { console.log(`  HOST: D SKIPPED — anchor x${n} (new-file view highlighting)`); }
 if (eN === 1) { work = work.replace(eFrom, () => eTo); applied.push(`E openFile jump [loc=${e[1]}, ns=${e[8]}]`); }
 else { console.log(`  HOST: E SKIPPED — anchor x${eN} (openFile jump-to-edit)`); }
+if (gN === 1) { work = work.replace(gFrom, () => gTo); applied.push(`G applied-edit diff [fn=${g[1]}, apply=${g[24]}, token=${g[13]}]`); }
+else { console.log(`  HOST: G SKIPPED — anchor x${gN} (native diff of an already-applied edit)`); }
 
 fs.writeFileSync(FILE, work);
-console.log(`  HOST: ${applied.length}/2 edits applied — ${applied.join("; ")}`);
+console.log(`  HOST: ${applied.length}/3 edits applied — ${applied.join("; ")}`);
 NODE
 }
 
@@ -345,7 +442,8 @@ for d in "${dirs[@]}"; do
        && grep -qF 'write-preview-scroll' "$css" 2>/dev/null \
        && grep -qF 'expanded-message-unstick' "$css" 2>/dev/null \
        && { [ ! -f "$host" ] || grep -qF '$z=$q.lastIndexOf(".")' "$host" 2>/dev/null; } \
-       && { [ ! -f "$host" ] || grep -qF '$at=$doc.offsetAt(new' "$host" 2>/dev/null; }; then
+       && { [ ! -f "$host" ] || grep -qF '$at=$doc.offsetAt(new' "$host" 2>/dev/null; } \
+       && { [ ! -f "$host" ] || grep -qF 'claude-ext-repatch:applied-edit' "$host" 2>/dev/null; }; then
       exit 0
     fi
   fi

@@ -1,6 +1,6 @@
 # claude-code-vscode-ui-fixes
 
-Local patches for six UX shortcomings in the **Claude Code VS Code extension**.
+Local patches for seven UX shortcomings in the **Claude Code VS Code extension**.
 
 These are applied to the extension's bundles (webview + host) on *your own machine*.
 The repo contains **only the patch script** — never any of Anthropic's code (see
@@ -13,11 +13,12 @@ When the Claude Code extension shows tool activity in its panel:
 | # | Symptom | Fix |
 |---|---------|-----|
 | **A** | A **Write** (new file) preview is clipped to ~2–3 lines with no way to scroll. | Make the Write preview a scrollable, taller box. |
-| **B** | Clicking an **Edit** diff card shows a tiny in-panel diff with no surrounding context. | Clicking it now opens VS Code's **native diff** (real file ↔ file-with-edit), with full context and real line numbers. Falls back to the original in-panel diff if the edit is already applied. |
+| **B** | Clicking an **Edit** diff card shows a tiny in-panel diff with no surrounding context. | Clicking it now opens VS Code's **native diff** (real file ↔ file-with-edit), with full context and real line numbers. Falls back to the original in-panel diff when neither side of the edit can be matched in the file. |
 | **C** | Clicking the Edit card's **filename** opens the file at line 1. | The card now sends both sides of the edit, so the jump targets the text that is actually in the file. |
 | **D** | Clicking a **Write** (new file) card opens its content in a separate editor tab with **no syntax highlighting** (everything is plain text). | The new file gets its real extension back so VS Code highlights it. |
 | **E** | …and that filename jump still landed on line 1 anyway: the host looks the text up with a single exact match and does **nothing at all** when it misses — which is most of the time, since the card's "before" text is gone from the file as soon as the edit is applied. | The host now tries both sides of the edit, then falls back to matching the edit's most distinctive line ignoring indentation, so it still lands after the file has been reformatted or re-edited. |
 | **F** | Clicking **"Show more"** on a long message makes it cover the whole rest of the transcript — pinned to the top of the panel, hiding everything after it until you click "Show less" again. A message is a *sticky* header (so you keep seeing your question), and expanding it removes its height cap, so it grows past the viewport while staying pinned. | The message stops being sticky while it is expanded, so the rest of the transcript simply comes after it and you scroll past it normally. |
+| **G** | …and fix B's native diff only ever worked on a **pending** edit. Click a card for an edit that is already applied — which is most of them — and you still got the tiny in-panel diff, because the host builds the diff by re-applying the edit to the file on disk, and the "before" text is gone from it. | For an applied edit the host now reconstructs the file *before* the edit (by applying it in reverse, and checking the round-trip lands back on the current file byte for byte) and diffs that against the real file, so you get full context and the file's own line numbers either way. |
 
 ### Why patch locally instead of waiting for upstream?
 
@@ -34,13 +35,15 @@ got human triage. Self-patching is currently the only reliable path.
 
 The extension ships **minified, closed-source** bundles: the webview
 (`webview/index.{js,css}`, fixes A/B/C/F) and the extension host (`extension.js`,
-fixes D/E). Fix B reuses an RPC the extension **already implements** internally
+fixes D/E/G). Fix B reuses an RPC the extension **already implements** internally
 (`open_diff` → `vscode.diff`) but never wires to the diff card's click. Fix D moves
 the random disambiguator the host appends to a new file's virtual name — from *after*
 the extension (`Foo.php (a1b2c3)`, which VS Code can't recognize) to *before* it
 (`Foo (a1b2c3).php`), so language detection — and therefore highlighting — kicks in.
 Fix E rewrites the host's "reveal this text" step, which the filename click (fix C)
-depends on; D and E are applied independently, so one broken anchor can't cost the other.
+depends on. Fix G adds the already-applied case to fix B's diff, and is opt-in on a marker
+the webview sends with the click, so the CLI's own `open_diff` still fails the way it
+expects to. D, E and G are applied independently, so one broken anchor can't cost the others.
 The script:
 
 - patches **only the highest-versioned** installed build;
@@ -51,10 +54,11 @@ The script:
   names, tool tags, handler vars, the short `e,t,i,n` locals) and every CSS-module class
   hash is *discovered* from the bundle, never written into the anchor — only source-level
   names (`original:`, `filePath:`, `old_string`, `openContent`, `"Write"`, …) are matched
-  literally. If an anchor is missing or ambiguous (e.g. after a big upstream rewrite) it
+  literally. Argument *positions* are discovered the same way, by reading the callee's own
+  signature. If an anchor is missing or ambiguous (e.g. after a big upstream rewrite) it
   **skips that fix and prints `ABORTED`/`SKIPPED`** rather than corrupting the bundle;
-- treats the webview fixes (A/B/C) and the host fix (D) as **independent** — a
-  failure in one leaves the other applied;
+- treats the webview fixes (A/B/C/F) and the host fixes (D/E/G) as **independent** — a
+  failure in one leaves the others applied;
 - verifies `node --check` on each patched JS bundle and rolls it back if it somehow
   doesn't parse.
 
@@ -98,9 +102,10 @@ reinstall the extension (or restore each `webview/index.{js,css}.orig` and
 - After an extension **update during a running VS Code session**, the patch is
   re-applied at your next login, but you still need to reload/restart VS Code to
   load the new bundle.
-- Fix B's native diff needs the edit's "before" text to still exist in the file. For
-  an **already-applied** edit it can't reconstruct it, so it falls back to the
-  original in-panel diff. The full-file-context diff is best on a **pending** edit.
+- Fix B's native diff needs one side of the edit to still be in the file — the "before"
+  text for a pending edit, the "after" text for an applied one (fix G). If the file has
+  moved on since the card was produced, neither matches and the click falls back to the
+  original in-panel diff.
 - Anchor strings are tied to the minified bundle. A major upstream rewrite will make
   some fixes `SKIPPED` — that's the signal to re-locate them, not a breakage.
 - The webview never receives the full file content (only the changed hunk), so an
