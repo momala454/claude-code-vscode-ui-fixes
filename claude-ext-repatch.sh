@@ -85,7 +85,10 @@ esac
 # only on failure paths, so a normal run pays no extra parse.
 pristine_broken() {
   [ -f "$1.orig" ] || return 1
-  node --check "$1.orig" 2>/dev/null && return 1
+  # Through stdin, not by path: node picks the module format from the file EXTENSION and
+  # refuses `.orig` outright (ERR_UNKNOWN_FILE_EXTENSION), which made every pristine backup
+  # look corrupt and sent each JS abort down the "reinstall the extension" red herring.
+  node --check < "$1.orig" 2>/dev/null && return 1
   echo "    NOTE: $(basename "$1") does not parse before any edit of ours ($(stat -c %s "$1.orig") bytes)."
   echo "    That is a corrupt install, not a patch problem — reinstall the extension."
   return 0
@@ -173,7 +176,10 @@ const reEsc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, (c) => "\\" + c);
 // The fileOpener object: 1..3 = openContent params, 4 = its connection local.
 const openerM = s.match(new RegExp(`openContent:\\((${ID}),(${ID}),(${ID})\\)=>\\{let (${ID})=this\\.comms\\.connection\\.value;if\\(\\4\\)return \\4\\.openContent\\(\\1,\\2,\\3\\);return Promise\\.resolve\\(void 0\\)\\}\\};startNewConversationTab`));
 // Diff component: function NAME({original:_,modified:_,language:_="plaintext",filePath:_})
-const diffM  = s.match(new RegExp(`function (${ID})\\(\\{original:(${ID}),modified:(${ID}),language:(${ID})="plaintext",filePath:(${ID})\\}\\)`));
+// `language` is OPTIONAL: 2.1.319 dropped that prop (the component now derives the language
+// from filePath itself), and requiring it is what broke B2/B3/B4 there. Group 4 is then
+// undefined, here and in the click handler alike, so the scope cross-check still holds.
+const diffM  = s.match(new RegExp(`function (${ID})\\(\\{original:(${ID}),modified:(${ID}),(?:language:(${ID})="plaintext",)?filePath:(${ID})\\}\\)`));
 const diffFn = diffM ? diffM[1] : null;
 // Edit tool tag: the Edit body renders the diff via <jsxHelper>(<diffFn>,{original:t.old_string...});
 // the Edit header is `name=<TAG>;header(_,t){return this.fileToolHeader(this.name,t.file_path,{searchText:t.new_string})}`
@@ -185,7 +191,14 @@ const bodyM = diffFn ? s.match(new RegExp(`\\(${reEsc(diffFn)},\\{original:(${ID
 // the helper are minified and rename across releases (was `v=()=>{p(...)}` in older builds,
 // `C=()=>{p(...)}` in 2.1.191), so DISCOVER both instead of hardcoding. The destructured
 // arg shape {original:_,modified:_,language:_,filePath:_} is the stable anchor.
-const clickH = s.match(new RegExp(`(${ID})=\\(\\)=>\\{(${ID})\\(\\{original:(${ID}),modified:(${ID}),language:(${ID}),filePath:(${ID})\\}\\)\\}`));
+// Searched INSIDE the diff component only (from its signature on), not across the bundle:
+// without `language` the shape is just three locals that are the commonest minified names
+// (e,t,n), so an unrelated `x=()=>{f({original:e,modified:t,filePath:n})}` earlier in the
+// bundle would pass the scope cross-check below, get patched instead, and leave the real
+// handler untouched while the script reports success (the injected `typeof $openFn` cannot
+// throw, so nothing would even break). The handler sits ~2.1 KB into the component on
+// 2.1.318/319; the 10 KB window fails CLOSED (B3 not found, abort) if it ever moves further.
+const clickH = diffM ? s.slice(diffM.index, diffM.index + 10000).match(new RegExp(`(${ID})=\\(\\)=>\\{(${ID})\\(\\{original:(${ID}),modified:(${ID}),(?:language:(${ID}),)?filePath:(${ID})\\}\\)\\}`)) : null;
 const clickVar = clickH ? clickH[1] : null;
 const modalFn  = clickH ? clickH[2] : null;
 
@@ -204,7 +217,7 @@ const openDiffCall = (() => {
   const args = new Array(Math.max(...idx) + 1).fill("void 0");
   const [iOrig, iNew, iEdits, iMulti, iToken] = idx;
   args[iOrig] = "$a"; args[iNew] = "$a"; args[iEdits] = "$b"; args[iMulti] = "!1";
-  args[iToken] = '"claude-ext-repatch:applied-edit/2"';
+  args[iToken] = '"claude-ext-repatch:applied-edit/3"';
   return `$c.openDiff(${args.join(",")})`;
 })();
 
@@ -224,7 +237,7 @@ const edits = [
   // back to the original in-webview Monaco modal (modalFn) instead of doing nothing.
   clickH && { name: "B3 overlay -> onOpenFile + modal fallback",
     from: clickH[0],
-    to:   `${clickVar}=()=>{let $m=()=>${modalFn}({original:${clickH[3]},modified:${clickH[4]},language:${clickH[5]},filePath:${clickH[6]}});if(typeof $openFn=="function"){let $r=$openFn();if($r&&$r.catch)$r.catch($m);else if(!$r)$m()}else $m()}` },
+    to:   `${clickVar}=()=>{let $m=()=>${modalFn}({original:${clickH[3]},modified:${clickH[4]},${clickH[5] ? `language:${clickH[5]},` : ""}filePath:${clickH[6]}});if(typeof $openFn=="function"){let $r=$openFn();if($r&&$r.catch)$r.catch($m);else if(!$r)$m()}else $m()}` },
   // Edit body returns the openDiff promise from onOpenFile so the overlay can catch.
   // Anchor on `(<diffFn>,{...})` only — NOT the jsx helper before it. That helper used to
   // be `createElement(` (React classic runtime) and is now `b(` (automatic jsx runtime);
@@ -420,40 +433,50 @@ const eN = eFrom === null ? 0 : s.split(eFrom).length - 1;
 // numbers. Strictly opt-in on the marker diffToken B1 sends: the CLI's own open_diff calls
 // keep throwing exactly as today, because the CLI needs that error.
 //
-// The anchor is the whole prologue of the diff helper, from its signature through the
-// apply call. Every name in it is minified — the 12 parameters included — so all of them
-// are capture groups; only the source-level literals ("/", the ✻ title, the log strings,
-// .Uri.file, "utf8", "leftTempFileProvider.createFile") are matched literally. That span
-// is also what makes the match self-validating: it pins each parameter to its position.
+// The anchor is the diff helper from its signature through the apply call. Every name in it
+// is minified — the 12 parameters included — so all of them are capture groups. Matching
+// the whole prologue VERBATIM broke on 2.1.318, which only reshuffled it (title split into
+// its own local, a new "file not read" branch), so the prologue is now a lazy span checked
+// piece by piece below: what G needs from it is found by its source-level literals ("diff
+// from", .Uri.file, .getText(), "leftTempFileProvider.createFile"), not by its layout.
 // 1=fn, 2..13=params (output, leftProvider, rightProvider, originalFilePath, newFilePath,
 // edits, supportMultiEdits, acceptEvent, abortSignal, panelRegistry, channelId, diffToken),
-// 14/15=basenames, 16=title, 17=left uri, 18=vscode ns, 19=left content, 20=doc, 21=fs,
-// 22=catch arg, 23=applied content, 24=the apply function.
+// 14=the prologue, 15=applied content, 16=the apply function, 17=left content.
 // The token is the contract between B1 (webview) and G (host), so it carries a REVISION:
 // bump it on every change to either side's logic. It is also what --if-needed greps for, so
 // bumping it is what makes an install patched by an older revision of this script look
 // unpatched and get redone. Without that, a changed injection silently never reaches a
 // machine that only ever runs --if-needed from its login hook.
-const MARK = "claude-ext-repatch:applied-edit/2";
+const MARK = "claude-ext-repatch:applied-edit/3";
+const reEsc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, (c) => "\\" + c);
 const g = s.match(new RegExp(
-  `async function (${ID})\\((${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID})\\)\\{`
-  + `let (${ID})=\\5\\.split\\("/"\\)\\.pop\\(\\)\\|\\|\\5,(${ID})=\\6\\.split\\("/"\\)\\.pop\\(\\)\\|\\|\\6,`
-  + `(${ID})=\`✻ \\[Claude Code\\] \\$\\{\\14===\\15\\?\\14:\`\\$\\{\\14\\} → \\$\\{\\15\\}\`\\}\`;`
-  + `\\2\\.info\\("diff from",\\5,"to",\\6,"as",\\16\\);`
-  + `let (${ID})=(${ID})\\.Uri\\.file\\(\\5\\),(${ID})="";`
-  + `try\\{let (${ID})=await \\18\\.workspace\\.openTextDocument\\(\\17\\);`
-  + `if\\(\\20\\.isDirty\\)\\19=(${ID})\\.readFileSync\\(\\5,"utf8"\\),\\17=\\3\\.createFile\\(\\5,\\19\\)\\.uri;`
-  + `else \\19=\\20\\.getText\\(\\)\\}`
-  + `catch\\((${ID})\\)\\{\\2\\.info\\("leftTempFileProvider\\.createFile",\\5\\),\\17=\\3\\.createFile\\(\\5,""\\)\\.uri\\}`
-  + `let (${ID})=(${ID})\\(\\19,\\7\\),`));
+  `async function (${ID})\\(${Array.from({ length: 12 }, () => `(${ID})`).join(",")}\\)\\{`
+  + `((?:(?!async function )[\\s\\S]){0,2500}?)`
+  + `let (${ID})=(${ID})\\((${ID}),\\7\\),`));
+// Each piece G relies on must be found in the prologue, tied to the captured parameters:
+// the title passed to the "diff from" log, the vscode namespace from Uri.file(originalPath),
+// the left content being the open document's text, the left provider's createFile fallback.
+// 2.1.318 added a "file not read" flag: the left content is then NOT the file but the
+// old_strings joined — reverting an edit against that would diff a file that never existed,
+// so when that flag exists G stays out of the way while it is set.
+const gPro = g ? g[14] : "";
+const gTitle = g ? gPro.match(new RegExp(`${reEsc(g[2])}\\.info\\("diff from",${reEsc(g[5])},"to",${reEsc(g[6])},"as",(${ID})\\)`)) : null;
+const gNs = g ? gPro.match(new RegExp(`(${ID})\\.Uri\\.file\\(${reEsc(g[5])}\\)`)) : null;
+const gNotRead = g ? gPro.match(new RegExp(`if\\((${ID})\\)throw ${reEsc(g[17])}=`)) : null;
 // The call site proves the first three arguments really are output/left/right provider,
 // hence that the positional reading of the other nine holds. If the shapes ever disagree,
 // skip G rather than inject code reading the wrong parameters.
-const gTail = g ? `let ${g[23]}=${g[24]}(${g[19]},${g[7]}),` : null;
-const gOk = !!g && s.includes(`${g[1]}(this.output,this.leftTempFileProvider,this.rightTempFileProvider,`) && g[0].endsWith(gTail);
+const gTail = g ? `let ${g[15]}=${g[16]}(${g[17]},${g[7]}),` : null;
+const gOk = !!g && !!gTitle && !!gNs
+  && s.includes(`${g[1]}(this.output,this.leftTempFileProvider,this.rightTempFileProvider,`)
+  && new RegExp(`${reEsc(g[17])}=${ID}\\.getText\\(\\)`).test(gPro)
+  && gPro.includes(`${g[2]}.info("leftTempFileProvider.createFile",${g[5]}`)
+  && gPro.includes(`${g[3]}.createFile(${g[5]},`)
+  && g[0].endsWith(gTail);
 const gFrom = gOk ? g[0] : null;
 const gTo = gFrom === null ? null : (() => {
-  const [, , , lprov, , opath, , edits, , , , , , tok, , , title, , ns, lcontent] = g;
+  const [, , , lprov, , opath, , edits, , , , , , tok] = g;
+  const title = gTitle[1], ns = gNs[1], lcontent = g[17];
   // $b = the reconstructed before-content; left pane = a temp doc keyed on the real path
   // (so it keeps the extension, hence the highlighting), right pane = the file itself.
   // Then put the cursor on the first line that differs, so a 2000-line file does not open
@@ -474,7 +497,7 @@ const gTo = gFrom === null ? null : (() => {
   // every occurrence WAS edited: there is nothing to disambiguate, reverting them all
   // rebuilds the before-state exactly, and requiring one occurrence would just cost those
   // cards their diff.
-  const inj = `if(${tok}===${JSON.stringify(MARK)}){`
+  const inj = `if(${tok}===${JSON.stringify(MARK)}${gNotRead ? `&&!${gNotRead[1]}` : ""}){`
     + `let $ap=${edits}.length>0;`
     + `for(let $x of ${edits}){let $o=$x.oldString,$nw=$x.newString;`
     + `if(typeof $o!="string"||typeof $nw!="string"||$o===""||$nw===""){$ap=!1;break}`
@@ -486,8 +509,8 @@ const gTo = gFrom === null ? null : (() => {
     + `if($i!==-1){$ap=!1;break}}`
     + `if($ap){`
     + `let $r=[...${edits}].reverse().map(($x)=>({oldString:$x.newString,newString:$x.oldString,replaceAll:$x.replaceAll})),$b=null;`
-    + `try{$b=${g[24]}(${lcontent},$r)}catch{}`
-    + `if($b!==null&&$b!==${lcontent}){let $ok=!1;try{$ok=${g[24]}($b,${edits})===${lcontent}}catch{}`
+    + `try{$b=${g[16]}(${lcontent},$r)}catch{}`
+    + `if($b!==null&&$b!==${lcontent}){let $ok=!1;try{$ok=${g[16]}($b,${edits})===${lcontent}}catch{}`
     + `if($ok){let $lu=${lprov}.createFile(${opath},$b).uri,$ru=${ns}.Uri.file(${opath});`
     + `await ${ns}.commands.executeCommand("vscode.diff",$lu,$ru,${title}+" (before ↔ current)",{preview:!1});`
     + `try{let $k=0;while($k<$b.length&&$k<${lcontent}.length&&$b.charCodeAt($k)===${lcontent}.charCodeAt($k))$k++;`
@@ -518,13 +541,20 @@ if (n === 1) { work = work.replace(from, () => to); applied.push(`D new-file vie
 else { console.log(`  HOST: D SKIPPED — anchor x${n} (new-file view highlighting)`); }
 if (eN === 1) { work = work.replace(eFrom, () => eTo); applied.push(`E openFile jump [loc=${e[1]}, ns=${e[8]}]`); }
 else { console.log(`  HOST: E SKIPPED — anchor x${eN} (openFile jump-to-edit)`); }
-if (gN === 1) { work = work.replace(gFrom, () => gTo); applied.push(`G applied-edit diff [fn=${g[1]}, apply=${g[24]}, token=${g[13]}]`); }
+if (gN === 1) { work = work.replace(gFrom, () => gTo); applied.push(`G applied-edit diff [fn=${g[1]}, apply=${g[16]}, token=${g[13]}${gNotRead ? `, notRead=${gNotRead[1]}` : ""}]`); }
 else { console.log(`  HOST: G SKIPPED — anchor x${gN} (native diff of an already-applied edit)`); }
 
 fs.writeFileSync(FILE, work);
 console.log(`  HOST: ${applied.length}/3 edits applied — ${applied.join("; ")}`);
 NODE
 }
+
+# One run at a time. The login hook fires on every shell, so two terminals opened together
+# ran two patchers over the same files — one copying .orig over index.js while the other was
+# reading it — which produced spurious anchor failures and interleaved logs. The second run
+# waits, then finds everything patched and (under --if-needed) does nothing.
+exec 9>"${HOME}/.claude-ext-repatch.lock"
+flock 9
 
 shopt -s nullglob
 mapfile -t roots < <(ext_roots | awk '!seen[$0]++')
@@ -596,7 +626,7 @@ for d in "${dirs[@]}"; do
        && grep -qF 'expanded-message-unstick' "$css" 2>/dev/null \
        && { [ ! -f "$host" ] || grep -qF '$z=$q.lastIndexOf(".")' "$host" 2>/dev/null; } \
        && { [ ! -f "$host" ] || grep -qF '$at=$doc.offsetAt(new' "$host" 2>/dev/null; } \
-       && { [ ! -f "$host" ] || grep -qF 'claude-ext-repatch:applied-edit/2' "$host" 2>/dev/null; }; then
+       && { [ ! -f "$host" ] || grep -qF 'claude-ext-repatch:applied-edit/3' "$host" 2>/dev/null; }; then
       continue  # not `exit`: the other kept build may still need patching
     fi
   fi
