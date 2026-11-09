@@ -64,7 +64,93 @@
 
 set -euo pipefail
 
-EXT_GLOB="${HOME}/.vscode-server/extensions/anthropic.claude-code-*-linux-x64"
+# Modes: (none) patch now · --if-needed patch only what is not already patched, silently
+# (the login hook) · --restore put every build back to its pristine backup, for "before"
+# screenshots. An unknown argument used to be treated as "patch now", which silently did the
+# opposite of what a typo asked for.
+mode="${1:-}"
+case "$mode" in
+  "" | --if-needed | --restore) ;;
+  *) echo "usage: $(basename "$0") [--if-needed|--restore]" >&2; exit 2 ;;
+esac
+
+# Put back every file we kept a pristine backup of; sets `restored` to 1 when something
+# actually changed, so callers can stay quiet otherwise. Restoring a build that is already
+# pristine would rewrite three multi-MB bundles and print a line on every single login.
+# `return 0` is deliberate: the && chain above it ends non-zero when the last file was
+# already pristine, which under `set -e` would abort the script at the call site.
+# A truncated or corrupt install fails both ways — its anchors cannot match AND it cannot
+# parse — so "bundle shape changed" and "syntax FAILED" would both point at the wrong
+# culprit. Returns 0, and explains, when the PRISTINE backup is itself unparseable. Called
+# only on failure paths, so a normal run pays no extra parse.
+pristine_broken() {
+  [ -f "$1.orig" ] || return 1
+  node --check "$1.orig" 2>/dev/null && return 1
+  echo "    NOTE: $(basename "$1") does not parse before any edit of ours ($(stat -c %s "$1.orig") bytes)."
+  echo "    That is a corrupt install, not a patch problem — reinstall the extension."
+  return 0
+}
+
+restore_build() {
+  local f
+  restored=0
+  for f in "$@"; do
+    [ -f "$f.orig" ] && ! cmp -s "$f" "$f.orig" && { cp "$f.orig" "$f"; restored=1; }
+  done
+  return 0
+}
+
+# Where VS Code keeps its extensions. Several roots can be live at once, and which one is
+# in play depends on how the project was opened: over Remote-WSL the extension runs INSIDE
+# wsl (~/.vscode-server, linux-x64 build), while a project opened from a WINDOWS folder runs
+# it on the Windows side (%USERPROFILE%\.vscode, win32-x64 build) and never touches
+# ~/.vscode-server at all — which is why those windows kept showing unpatched cards. Same
+# bundles, same anchors, different tree; both are writable from wsl, so patch every root.
+#
+# The Windows profiles are found through the drives wsl already mounts for us, read out of
+# /proc/mounts (fstype drvfs on wsl1, 9p with aname=drvfs on wsl2), so no drive letter is
+# assumed; a mount with no Users directory is not a drive root and is skipped. Every profile
+# that has the extension installed gets patched — set CLAUDE_EXT_WIN_HOME to a single
+# Windows home to skip the search and restrict it to that one.
+ext_roots() {
+  local r p mp
+  for r in "${HOME}/.vscode-server" "${HOME}/.vscode-server-insiders"; do
+    [ -d "$r/extensions" ] && printf '%s\n' "$r/extensions"
+  done
+  if [ -n "${CLAUDE_EXT_WIN_HOME:-}" ]; then
+    for p in "${CLAUDE_EXT_WIN_HOME}"/.vscode*/extensions; do
+      [ -d "$p" ] && printf '%s\n' "$p"
+    done
+    return 0
+  fi
+  [ -r /proc/mounts ] || return 0
+  local me="${USER:-}" mine=() other=() prof
+  me="${me,,}"
+  while read -r mp; do
+    [ -d "$mp/Users" ] || continue
+    for p in "$mp"/Users/*/.vscode*/extensions; do
+      [ -d "$p" ] || continue
+      prof="$(basename "$(dirname "$(dirname "$p")")")"
+      if [ -n "$me" ] && [ "${prof,,}" = "$me" ]; then
+        mine+=( "$p" )
+      else
+        # Someone else's profile: only worth touching if the extension is really installed
+        # there, and only when we could not find our own (see below).
+        compgen -G "$p/anthropic.claude-code-*" >/dev/null && other+=( "$p" )
+      fi
+    done
+  done < <(awk '$3=="drvfs"||($3=="9p"&&$4~/aname=drvfs/){print $2}' /proc/mounts)
+  # Prefer the Windows profile whose name matches this login name — writing into another
+  # account's profile (a second user, or an old Users tree left on a secondary drive) would
+  # patch bundles and drop ~11 MB of .orig backups somewhere nobody asked for. Fall back to
+  # the profiles that do have the extension only when no name matches, which is the case of
+  # a Windows account named differently from the wsl one; CLAUDE_EXT_WIN_HOME settles it.
+  if [ ${#mine[@]} -gt 0 ]; then
+    printf '%s\n' "${mine[@]}"
+  elif [ ${#other[@]} -gt 0 ]; then
+    printf '%s\n' "${other[@]}"
+  fi
+}
 
 js_patch() {
   FILE="$1" node - <<'NODE'
@@ -118,7 +204,7 @@ const openDiffCall = (() => {
   const args = new Array(Math.max(...idx) + 1).fill("void 0");
   const [iOrig, iNew, iEdits, iMulti, iToken] = idx;
   args[iOrig] = "$a"; args[iNew] = "$a"; args[iEdits] = "$b"; args[iMulti] = "!1";
-  args[iToken] = '"claude-ext-repatch:applied-edit"';
+  args[iToken] = '"claude-ext-repatch:applied-edit/2"';
   return `$c.openDiff(${args.join(",")})`;
 })();
 
@@ -343,7 +429,12 @@ const eN = eFrom === null ? 0 : s.split(eFrom).length - 1;
 // edits, supportMultiEdits, acceptEvent, abortSignal, panelRegistry, channelId, diffToken),
 // 14/15=basenames, 16=title, 17=left uri, 18=vscode ns, 19=left content, 20=doc, 21=fs,
 // 22=catch arg, 23=applied content, 24=the apply function.
-const MARK = "claude-ext-repatch:applied-edit";
+// The token is the contract between B1 (webview) and G (host), so it carries a REVISION:
+// bump it on every change to either side's logic. It is also what --if-needed greps for, so
+// bumping it is what makes an install patched by an older revision of this script look
+// unpatched and get redone. Without that, a changed injection silently never reaches a
+// machine that only ever runs --if-needed from its login hook.
+const MARK = "claude-ext-repatch:applied-edit/2";
 const g = s.match(new RegExp(
   `async function (${ID})\\((${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID}),(${ID})\\)\\{`
   + `let (${ID})=\\5\\.split\\("/"\\)\\.pop\\(\\)\\|\\|\\5,(${ID})=\\6\\.split\\("/"\\)\\.pop\\(\\)\\|\\|\\6,`
@@ -367,17 +458,46 @@ const gTo = gFrom === null ? null : (() => {
   // (so it keeps the extension, hence the highlighting), right pane = the file itself.
   // Then put the cursor on the first line that differs, so a 2000-line file does not open
   // at line 1 — same intent as fix E, and a no-op if the diff editor already got there.
+  // Decide FIRST whether the edit is already applied, and let old_string decide it: while
+  // old_string is still in the file the edit is pending, upstream's forward apply is right,
+  // and we must keep out of the way. The one exception is an old_string that is only there
+  // because it is part of the new_string that WAS applied (old_string a substring of
+  // new_string) — an occurrence covered by an occurrence of new_string does not count as
+  // "still there". Skipping this test is not harmless: for a PENDING edit whose new_string
+  // also appears earlier in the file (the same ALTER TABLE line in a migration's up() and
+  // down(), say), reverting the first occurrence yields a before-state that round-trips
+  // perfectly and shows the change at the wrong occurrence. For the same reason new_string
+  // must occur EXACTLY ONCE: if it occurs twice, nothing in the card says which one was
+  // edited, and reverting either produces a before-state that round-trips — so refuse to
+  // guess and let the click fall back to the in-panel diff rather than point somewhere
+  // plausible and wrong. That uniqueness demand is waived for a `replace_all` edit, where
+  // every occurrence WAS edited: there is nothing to disambiguate, reverting them all
+  // rebuilds the before-state exactly, and requiring one occurrence would just cost those
+  // cards their diff.
   const inj = `if(${tok}===${JSON.stringify(MARK)}){`
+    + `let $ap=${edits}.length>0;`
+    + `for(let $x of ${edits}){let $o=$x.oldString,$nw=$x.newString;`
+    + `if(typeof $o!="string"||typeof $nw!="string"||$o===""||$nw===""){$ap=!1;break}`
+    + `let $f=${lcontent}.indexOf($nw);if($f===-1){$ap=!1;break}`
+    + `if(!$x.replaceAll&&${lcontent}.indexOf($nw,$f+1)!==-1){$ap=!1;break}`
+    + `let $i=-1;while(($i=${lcontent}.indexOf($o,$i+1))!==-1){let $cv=!1,$j=-1;`
+    + `while(($j=${lcontent}.indexOf($nw,$j+1))!==-1)if($i>=$j&&$i+$o.length<=$j+$nw.length){$cv=!0;break}`
+    + `if(!$cv)break}`
+    + `if($i!==-1){$ap=!1;break}}`
+    + `if($ap){`
     + `let $r=[...${edits}].reverse().map(($x)=>({oldString:$x.newString,newString:$x.oldString,replaceAll:$x.replaceAll})),$b=null;`
     + `try{$b=${g[24]}(${lcontent},$r)}catch{}`
     + `if($b!==null&&$b!==${lcontent}){let $ok=!1;try{$ok=${g[24]}($b,${edits})===${lcontent}}catch{}`
-    + `if($ok){let $lu=${lprov}.createFile(${opath},$b).uri;`
-    + `await ${ns}.commands.executeCommand("vscode.diff",$lu,${ns}.Uri.file(${opath}),${title}+" (before ↔ current)",{preview:!1});`
+    + `if($ok){let $lu=${lprov}.createFile(${opath},$b).uri,$ru=${ns}.Uri.file(${opath});`
+    + `await ${ns}.commands.executeCommand("vscode.diff",$lu,$ru,${title}+" (before ↔ current)",{preview:!1});`
     + `try{let $k=0;while($k<$b.length&&$k<${lcontent}.length&&$b.charCodeAt($k)===${lcontent}.charCodeAt($k))$k++;`
     + `let $ln=${lcontent}.slice(0,$k).split("\\n").length-1,$te=${ns}.window.activeTextEditor;`
-    + `if($te&&$te.document.uri.fsPath===${opath}){let $pp=new ${ns}.Position($ln,0),$rr=new ${ns}.Range($pp,$pp);`
+    // Compare the Uris, not the raw paths: on Windows fsPath comes back with backslashes and
+    // its own drive-letter casing, so a string compare against the path the card sent never
+    // matches and the reveal silently never happens. Uri.file() normalises both sides.
+    + `if($te&&$te.document.uri.toString()===$ru.toString()){let $pp=new ${ns}.Position($ln,0),$rr=new ${ns}.Range($pp,$pp);`
     + `$te.revealRange($rr,${ns}.TextEditorRevealType.InCenter),$te.selection=new ${ns}.Selection($pp,$pp)}}catch{}`
-    + `return}}}`;
+    + `return}}}}`;
   return gFrom.slice(0, gFrom.length - gTail.length) + inj + gTail;
 })();
 const gN = gFrom === null ? 0 : s.split(gFrom).length - 1;
@@ -407,32 +527,65 @@ NODE
 }
 
 shopt -s nullglob
-dirs=( $EXT_GLOB )
+mapfile -t roots < <(ext_roots | awk '!seen[$0]++')
+dirs=()
+for root in "${roots[@]}"; do dirs+=( "$root"/anthropic.claude-code-* ); done
 shopt -u nullglob
-[ ${#dirs[@]} -eq 0 ] && { echo "No Claude Code extension found under ${EXT_GLOB}"; exit 1; }
+[ ${#dirs[@]} -eq 0 ] && {
+  echo "No Claude Code extension found. Looked under:"
+  printf '  %s\n' "${roots[@]:-(no extensions directory at all)}"
+  exit 1
+}
 
-# VS Code runs the highest-versioned build. Patch only that one; restore any other
-# installed version to pristine (if we ever backed it up) so stale patched copies
-# don't linger. Versions are sortable by `sort -V` on the dir name.
-target="$(printf '%s\n' "${dirs[@]}" | sort -V | tail -1)"
+# Patch the TWO highest-versioned builds, not just the newest one, and restore anything
+# older. Patching only the newest silently broke the RUNNING VS Code window whenever an
+# extension update landed mid-session: the update installs the new build, this script (from
+# the login hook) then reverts the build the window is still executing, and the webview
+# re-reads it from disk the next time the panel is hidden and shown. The fixes vanish with
+# no message, and the only clue is that clicking a card stops sending its RPC at all. Two
+# builds covers it — the running window is on the previous version, the next reload lands on
+# the new one — without leaving patched copies behind for every version ever installed.
+# Per ROOT, not overall: the wsl-side and the Windows-side installs update independently, so
+# the newest two of one must not supersede the other's.
+keep=""
+for root in "${roots[@]}"; do
+  shopt -s nullglob
+  rdirs=( "$root"/anthropic.claude-code-* )
+  shopt -u nullglob
+  [ ${#rdirs[@]} -eq 0 ] && continue
+  keep+="$(printf '%s\n' "${rdirs[@]}" | sort -V | tail -2)"$'\n'
+done
+touched=0
 
 for d in "${dirs[@]}"; do
-  ver="$(basename "$d")"
+  # Several roots can hold the same version, so name the side — and, on the Windows side, the
+  # profile — otherwise two lines read identically and a failure can't be attributed.
+  case "$d" in
+    "$HOME"/*) ver="$(basename "$d") [wsl]" ;;
+    *)         ver="$(basename "$d") [windows:$(basename "${d%/.vscode*/extensions/*}")]" ;;
+  esac
   js="$d/webview/index.js"
   css="$d/webview/index.css"
   host="$d/extension.js"
   [ -f "$js" ] && [ -f "$css" ] || { echo "-> $ver (no webview bundle, skipping)"; continue; }
 
-  if [ "$d" != "$target" ]; then
-    # Not the active build: restore pristine if we have backups, then leave it.
-    [ -f "$js.orig" ]   && cp "$js.orig"   "$js"
-    [ -f "$css.orig" ]  && cp "$css.orig"  "$css"
-    [ -f "$host.orig" ] && cp "$host.orig" "$host"
-    echo "-> $ver (not active build; restored to pristine if patched)"
+  # --restore applies to EVERY build, patched or not, and undoes all three bundles — the
+  # webview pair and the host, which is the whole point: with the host left patched the
+  # "before" state is not one (D/E/G would still be in effect).
+  if [ "$mode" = "--restore" ]; then
+    restore_build "$js" "$css" "$host"
+    if [ "$restored" = 1 ]; then echo "-> $ver (restored to pristine)"; touched=1; fi
     continue
   fi
 
-  # --if-needed: skip silently when the active build already carries our patches
+  if ! printf '%s\n' "$keep" | grep -qxF "$d"; then
+    # Older than the two builds we keep patched: undo our edits, once.
+    restore_build "$js" "$css" "$host"
+    if [ "$restored" = 1 ]; then echo "-> $ver (superseded; restored to pristine)"; fi
+    continue
+  fi
+
+  # --if-needed: skip silently when this build already carries our patches
   # (avoids rewriting the bundle on every shell login). A fully patched install has
   # the webview openDiff method, the CSS marker, AND the host new-file-view fix.
   # Each marker is a fragment of code WE inject, never a minified name from the bundle,
@@ -443,12 +596,13 @@ for d in "${dirs[@]}"; do
        && grep -qF 'expanded-message-unstick' "$css" 2>/dev/null \
        && { [ ! -f "$host" ] || grep -qF '$z=$q.lastIndexOf(".")' "$host" 2>/dev/null; } \
        && { [ ! -f "$host" ] || grep -qF '$at=$doc.offsetAt(new' "$host" 2>/dev/null; } \
-       && { [ ! -f "$host" ] || grep -qF 'claude-ext-repatch:applied-edit' "$host" 2>/dev/null; }; then
-      exit 0
+       && { [ ! -f "$host" ] || grep -qF 'claude-ext-repatch:applied-edit/2' "$host" 2>/dev/null; }; then
+      continue  # not `exit`: the other kept build may still need patching
     fi
   fi
 
-  echo "-> $ver (active build)"
+  echo "-> $ver (patching)"
+  touched=1
   # One-time pristine backups, then re-derive from them so runs are idempotent.
   [ -f "$js.orig" ]   || cp "$js"   "$js.orig"
   [ -f "$css.orig" ]  || cp "$css"  "$css.orig"
@@ -463,12 +617,14 @@ for d in "${dirs[@]}"; do
 
   if [ "$js_rc" -ne 0 ]; then
     echo "  -> leaving webview bundle PRISTINE (JS patch aborted; CSS not applied)"
+    pristine_broken "$js" || true
     cp "$js.orig"  "$js"
     cp "$css.orig" "$css"
   elif ! node --check "$js" 2>/dev/null; then
-    echo "  syntax: FAILED -> rolling back BOTH webview files to pristine"
     cp "$js.orig"  "$js"
     cp "$css.orig" "$css"
+    echo "  syntax: FAILED -> rolled back BOTH webview files to pristine"
+    pristine_broken "$js" || true
   else
     css_patch "$css" "$js.orig"
     echo "  syntax: OK"
@@ -483,10 +639,12 @@ for d in "${dirs[@]}"; do
     host_patch "$host" || host_rc=$?
     if [ "$host_rc" -ne 0 ]; then
       echo "  -> leaving host bundle PRISTINE (HOST patch aborted)"
+      pristine_broken "$host" || true
       cp "$host.orig" "$host"
     elif ! node --check "$host" 2>/dev/null; then
-      echo "  host syntax: FAILED -> rolling back extension.js to pristine"
       cp "$host.orig" "$host"
+      echo "  host syntax: FAILED -> rolled back extension.js to pristine"
+      pristine_broken "$host" || true
     else
       echo "  host syntax: OK"
     fi
@@ -495,5 +653,15 @@ for d in "${dirs[@]}"; do
   fi
 done
 
-echo
-echo "Done. Reload VS Code (Cmd/Ctrl+Shift+P -> Developer: Reload Window) to apply."
+# Stay silent when there was nothing to do (nothing patched, nothing to put back): --if-needed
+# runs from the login hook on every
+# shell, and a reload reminder that reloading would not change anything is just noise.
+if [ "$touched" = 1 ]; then
+  echo
+  if [ "$mode" = "--restore" ]; then
+    echo "Done — bundles are pristine again. Reload VS Code (Cmd/Ctrl+Shift+P -> Developer:"
+    echo "Reload Window) to see the UNPATCHED extension; re-run without --restore to patch."
+  else
+    echo "Done. Reload VS Code (Cmd/Ctrl+Shift+P -> Developer: Reload Window) to apply."
+  fi
+fi

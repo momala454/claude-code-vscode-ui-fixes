@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# Temporarily restore the PRISTINE Claude Code extension bundle (undo the UI
-# patches) — for taking "before" screenshots. Re-apply with claude-ext-repatch.sh.
+#
+# Temporarily restore the PRISTINE Claude Code extension bundles (undo the UI patches) — for
+# taking "before" screenshots. Re-apply by running claude-ext-repatch.sh with no argument.
+#
+# This is a thin wrapper on purpose. Where the extensions live and which files carry patches
+# is knowledge the patcher already owns, and keeping a second copy of it here is exactly how
+# this script rotted: it only knew ~/.vscode-server/…-linux-x64, so it left a Windows-side
+# install fully patched, and it only put back webview/index.{js,css}, so the host fixes
+# (D/E/G) stayed in effect — a "before" screenshot that was not one.
 set -euo pipefail
-target="$(ls -d "${HOME}"/.vscode-server/extensions/anthropic.claude-code-*-linux-x64 2>/dev/null | sort -V | tail -1)"
-[ -n "$target" ] || { echo "no extension found"; exit 1; }
-for x in index.js index.css; do
-  f="$target/webview/$x"
-  if [ -f "$f.orig" ]; then cp "$f.orig" "$f"; echo "restored pristine: $x"; else echo "no backup for $x (already pristine?)"; fi
-done
-echo "Done. Reload VS Code (Developer: Reload Window) to see the UNPATCHED state."
+
+self_dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+if [ -x "$self_dir/claude-ext-repatch.sh" ]; then
+  exec "$self_dir/claude-ext-repatch.sh" --restore
+fi
+exec claude-ext-repatch.sh --restore   # installed copy, via PATH

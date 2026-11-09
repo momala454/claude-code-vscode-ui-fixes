@@ -18,7 +18,7 @@ When the Claude Code extension shows tool activity in its panel:
 | **D** | Clicking a **Write** (new file) card opens its content in a separate editor tab with **no syntax highlighting** (everything is plain text). | The new file gets its real extension back so VS Code highlights it. |
 | **E** | …and that filename jump still landed on line 1 anyway: the host looks the text up with a single exact match and does **nothing at all** when it misses — which is most of the time, since the card's "before" text is gone from the file as soon as the edit is applied. | The host now tries both sides of the edit, then falls back to matching the edit's most distinctive line ignoring indentation, so it still lands after the file has been reformatted or re-edited. |
 | **F** | Clicking **"Show more"** on a long message makes it cover the whole rest of the transcript — pinned to the top of the panel, hiding everything after it until you click "Show less" again. A message is a *sticky* header (so you keep seeing your question), and expanding it removes its height cap, so it grows past the viewport while staying pinned. | The message stops being sticky while it is expanded, so the rest of the transcript simply comes after it and you scroll past it normally. |
-| **G** | …and fix B's native diff only ever worked on a **pending** edit. Click a card for an edit that is already applied — which is most of them — and you still got the tiny in-panel diff, because the host builds the diff by re-applying the edit to the file on disk, and the "before" text is gone from it. | For an applied edit the host now reconstructs the file *before* the edit (by applying it in reverse, and checking the round-trip lands back on the current file byte for byte) and diffs that against the real file, so you get full context and the file's own line numbers either way. |
+| **G** | …and fix B's native diff only ever worked on a **pending** edit. Click a card for an edit that is already applied — which is most of them — and you still got the tiny in-panel diff, because the host builds the diff by re-applying the edit to the file on disk, and the "before" text is gone from it. | For an applied edit the host now reconstructs the file *before* the edit (by applying it in reverse) and diffs that against the real file, so you get full context and the file's own line numbers either way. It only does so when it can place the edit with certainty — `old_string` gone from the file and `new_string` present exactly once — and otherwise leaves the click alone rather than point at a plausible wrong occurrence. |
 
 ### Why patch locally instead of waiting for upstream?
 
@@ -46,7 +46,18 @@ the webview sends with the click, so the CLI's own `open_diff` still fails the w
 expects to. D, E and G are applied independently, so one broken anchor can't cost the others.
 The script:
 
-- patches **only the highest-versioned** installed build;
+- patches **every extension root it finds**: the one inside WSL (`~/.vscode-server`, the
+  `linux-x64` build, used by a project opened over Remote-WSL) *and* the Windows-side
+  profiles reached through the drives WSL mounts (`%USERPROFILE%\.vscode`, the `win32-x64`
+  build, used by a project opened from a Windows folder — that window never reads
+  `~/.vscode-server` at all). The drive letters come from `/proc/mounts`, none is assumed;
+  set `CLAUDE_EXT_WIN_HOME` to restrict the search to one Windows home. The two builds carry
+  the same webview and host bundles, so the same anchors match on both;
+- patches, **per root**, the **two highest-versioned** installed builds, and restores anything
+  older to pristine. Two, not one: an extension update that lands while VS Code is running would
+  otherwise strip the patches from the build your window is still executing — the webview
+  re-reads its bundle from disk whenever the panel is hidden and shown, so the fixes vanish
+  mid-session with no message;
 - keeps a one-time pristine backup of each touched file (`index.js.orig`,
   `index.css.orig`, `extension.js.orig`);
 - always re-derives from those backups, so it's **idempotent**;
@@ -81,9 +92,14 @@ after an extension update** (it's a no-op when already patched).
 ### Manual use
 
 ```bash
-claude-ext-repatch.sh            # patch the active build now
-claude-ext-repatch.sh --if-needed  # only patch if not already patched (used by the hook)
+claude-ext-repatch.sh              # patch now
+claude-ext-repatch.sh --if-needed  # only patch what isn't already patched (used by the hook)
+claude-ext-repatch.sh --restore    # put every bundle back to its pristine backup
 ```
+
+`--restore` undoes all three bundles (both webview files *and* the host) in every root, which
+is what you want for a "before" screenshot — leave the host patched and the "before" isn't
+one. `claude-ext-depatch.sh` is just a wrapper around it, kept for the old name.
 
 ### Uninstall
 
@@ -97,11 +113,16 @@ reinstall the extension (or restore each `webview/index.{js,css}.orig` and
 
 ## Limitations (honest)
 
-- **Linux / WSL2 only** right now (paths under `~/.vscode-server/extensions/`).
-  macOS/Windows paths differ and aren't handled.
-- After an extension **update during a running VS Code session**, the patch is
-  re-applied at your next login, but you still need to reload/restart VS Code to
-  load the new bundle.
+- **Runs from Linux / WSL2 only.** It patches both the WSL-side install and the Windows-side
+  one (through `/mnt/<drive>/Users/…`), so a project opened from a Windows folder is covered
+  — but the script itself is bash and expects those paths. A native Windows or macOS install,
+  with no WSL in the picture, isn't handled.
+- The `~/.profile` hook only fires when you open a **WSL shell**. If you work on a Windows
+  folder and never open one, the Windows-side build is not re-patched after an extension
+  update until you do (or until you run the script by hand).
+- After an extension **update during a running VS Code session**, the new build is patched
+  at your next login and the one your window is running keeps its patches, but you still
+  need to reload/restart VS Code to actually load the new bundle.
 - Fix B's native diff needs one side of the edit to still be in the file — the "before"
   text for a pending edit, the "after" text for an applied one (fix G). If the file has
   moved on since the card was produced, neither matches and the click falls back to the

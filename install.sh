@@ -6,7 +6,12 @@
 #   1. copies claude-ext-repatch.sh to ~/.local/bin/ (creating it if needed)
 #   2. runs the patcher once
 #   3. adds a backgrounded, no-op-when-already-patched call to ~/.profile so the
-#      patches are re-applied automatically after a Claude Code extension update
+#      patches are re-applied automatically after a Claude Code extension update.
+#      Its output goes to ~/.claude-ext-repatch.log rather than /dev/null: the patcher is
+#      silent when there is nothing to do, so the log only holds actual failures.
+#
+# To disable the hook: chmod -x ~/.local/bin/claude-ext-repatch.sh (the hook tests -x).
+# The hook lives in ~/.profile, not ~/.bashrc.
 #
 # Idempotent: re-running won't duplicate the .profile hook. Uninstall with
 # `./install.sh --uninstall` (removes the hook line and the installed script;
@@ -55,7 +60,7 @@ else
     echo ""
     echo "$HOOK_MARKER"
     echo "if [ -x \"\$HOME/.local/bin/claude-ext-repatch.sh\" ]; then"
-    echo "    ( \"\$HOME/.local/bin/claude-ext-repatch.sh\" --if-needed >/dev/null 2>&1 & )"
+    echo "    ( \"\$HOME/.local/bin/claude-ext-repatch.sh\" --if-needed >>\"\$HOME/.claude-ext-repatch.log\" 2>&1 & )"
     echo "fi"
   } >> "$PROFILE"
   echo "Added login hook to $PROFILE"
