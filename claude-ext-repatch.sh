@@ -217,7 +217,7 @@ const openDiffCall = (() => {
   const args = new Array(Math.max(...idx) + 1).fill("void 0");
   const [iOrig, iNew, iEdits, iMulti, iToken] = idx;
   args[iOrig] = "$a"; args[iNew] = "$a"; args[iEdits] = "$b"; args[iMulti] = "!1";
-  args[iToken] = '"claude-ext-repatch:applied-edit/3"';
+  args[iToken] = '"claude-ext-repatch:applied-edit/4"';
   return `$c.openDiff(${args.join(",")})`;
 })();
 
@@ -393,9 +393,16 @@ const n = from === null ? 0 : s.split(from).length - 1;
 // file just opens at line 1, which is the whole "I can't tell where the change was"
 // symptom. Fix C now sends new_string as searchText plus old_string as searchTextAlt, so
 // here we (1) try each candidate in turn, and (2) if neither survived verbatim (file
-// reformatted or re-edited since the card was produced), fall back to the longest
-// non-blank line of the edit matched against trimmed document lines. Only the reveal is
-// rewritten; the `heading` and `startLine` branches after it are untouched.
+// reformatted or re-edited since the card was produced), fall back to a single line of the
+// edit matched against trimmed document lines. Only the reveal is rewritten; the `heading`
+// and `startLine` branches after it are untouched.
+// The fallback must not jump somewhere plausible and wrong (same rule as G's gate). It used
+// to pool the lines of BOTH sides and take the longest one present anywhere: on a card that
+// turned a `for (const item of this.items.values()) {` loop into a reduce, that removed loop
+// line still existed in another method, and the click landed there (seen 2026-11-09). So:
+// the inserted side (searchText = new_string) is tried before the removed one, and a line
+// only counts when it occurs EXACTLY ONCE in the document — an ambiguous line is skipped for
+// the next one. When nothing is certain the file opens without a jump, as upstream does.
 // Every minified local is a capture group: 1=location, 2=document, 3=editor, 4=index,
 // 5/6=positions, 7=range, 8=the vscode namespace.
 const e = s.match(new RegExp(
@@ -409,11 +416,12 @@ const eTo = e === null ? null : (() => {
   return `if(${loc}?.searchText){let $ed=${ed},$doc=$ed.document,$txt=$doc.getText(),$at=-1,$len=0;`
     + `for(let $s of [${loc}.searchText,${loc}.searchTextAlt]){if(typeof $s!="string"||$s.length===0)continue;`
     + `let $i=$txt.indexOf($s);if($i!==-1){$at=$i,$len=$s.length;break}}`
-    + `if($at===-1){let $c=[];for(let $s of [${loc}.searchText,${loc}.searchTextAlt]){`
-    + `if(typeof $s=="string")for(let $l of $s.split("\\n")){let $t=$l.trim();if($t.length>=8)$c.push($t)}}`
+    + `if($at===-1)for(let $s of [${loc}.searchText,${loc}.searchTextAlt]){if(typeof $s!="string")continue;`
+    + `let $c=[];for(let $l of $s.split("\\n")){let $t=$l.trim();if($t.length>=8&&!$c.includes($t))$c.push($t)}`
     + `$c.sort(($a,$b)=>$b.length-$a.length);`
-    + `for(let $t of $c){for(let $i=0;$i<$doc.lineCount;$i++){let $l=$doc.lineAt($i).text;`
-    + `if($l.trim()===$t){$at=$doc.offsetAt(new ${ns}.Position($i,0)),$len=$l.length;break}}if($at!==-1)break}}`
+    + `for(let $t of $c){let $hit=-1,$n=0;for(let $i=0;$i<$doc.lineCount;$i++)if($doc.lineAt($i).text.trim()===$t){$n++;if($n>1)break;$hit=$i}`
+    + `if($n===1){$at=$doc.offsetAt(new ${ns}.Position($hit,0)),$len=$doc.lineAt($hit).text.length;break}}`
+    + `if($at!==-1)break}`
     + `if($at!==-1){let $p=$doc.positionAt($at),$q=$doc.positionAt($at+$len),$r=new ${ns}.Range($p,$q);`
     + `$ed.revealRange($r,${ns}.TextEditorRevealType.InCenter),$ed.selection=new ${ns}.Selection($p,$q)}}`;
 })();
@@ -447,7 +455,7 @@ const eN = eFrom === null ? 0 : s.split(eFrom).length - 1;
 // bumping it is what makes an install patched by an older revision of this script look
 // unpatched and get redone. Without that, a changed injection silently never reaches a
 // machine that only ever runs --if-needed from its login hook.
-const MARK = "claude-ext-repatch:applied-edit/3";
+const MARK = "claude-ext-repatch:applied-edit/4";
 const reEsc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, (c) => "\\" + c);
 const g = s.match(new RegExp(
   `async function (${ID})\\(${Array.from({ length: 12 }, () => `(${ID})`).join(",")}\\)\\{`
@@ -463,6 +471,9 @@ const gPro = g ? g[14] : "";
 const gTitle = g ? gPro.match(new RegExp(`${reEsc(g[2])}\\.info\\("diff from",${reEsc(g[5])},"to",${reEsc(g[6])},"as",(${ID})\\)`)) : null;
 const gNs = g ? gPro.match(new RegExp(`(${ID})\\.Uri\\.file\\(${reEsc(g[5])}\\)`)) : null;
 const gNotRead = g ? gPro.match(new RegExp(`if\\((${ID})\\)throw ${reEsc(g[17])}=`)) : null;
+// The node fs module, taken from upstream's own dirty-document branch (`b=fs.readFileSync(path,
+// "utf8")`). Optional: without it G falls back to the document text, i.e. to its old behaviour.
+const gFs = g ? gPro.match(new RegExp(`(${ID})\\.readFileSync\\(${reEsc(g[5])},"utf8"\\)`)) : null;
 // The call site proves the first three arguments really are output/left/right provider,
 // hence that the positional reading of the other nine holds. If the shapes ever disagree,
 // skip G rather than inject code reading the wrong parameters.
@@ -476,7 +487,18 @@ const gOk = !!g && !!gTitle && !!gNs
 const gFrom = gOk ? g[0] : null;
 const gTo = gFrom === null ? null : (() => {
   const [, , , lprov, , opath, , edits, , , , , , tok] = g;
-  const title = gTitle[1], ns = gNs[1], lcontent = g[17];
+  const title = gTitle[1], ns = gNs[1];
+  // Everything below works on $L, the file AS IT IS ON DISK, not on upstream's left content.
+  // For a clean document upstream takes the text of the document VS Code has open, and that
+  // copy can be stale: a file outside the workspace is not watched, so after the CLI edited
+  // it the extension host still held the pre-edit text 13 s later (seen 2026-11-09). The
+  // edit then looked PENDING, the gate rightly declined, and the first click showed
+  // upstream's diff; it only worked once the tab had been closed and reopened. Disk is
+  // also what upstream itself reads for a DIRTY document, so this changes nothing there.
+  // The right pane stays Uri.file: opening an editor on it makes VS Code reload a clean,
+  // stale model from disk, so both panes agree. A read failure keeps upstream's content.
+  const lcontent = "$L";
+  const base = `let $L=${g[17]};` + (gFs ? `try{$L=${gFs[1]}.readFileSync(${opath},"utf8")}catch{}` : "");
   // $b = the reconstructed before-content; left pane = a temp doc keyed on the real path
   // (so it keeps the extension, hence the highlighting), right pane = the file itself.
   // Then put the cursor on the first line that differs, so a 2000-line file does not open
@@ -498,6 +520,7 @@ const gTo = gFrom === null ? null : (() => {
   // rebuilds the before-state exactly, and requiring one occurrence would just cost those
   // cards their diff.
   const inj = `if(${tok}===${JSON.stringify(MARK)}${gNotRead ? `&&!${gNotRead[1]}` : ""}){`
+    + base
     + `let $ap=${edits}.length>0;`
     + `for(let $x of ${edits}){let $o=$x.oldString,$nw=$x.newString;`
     + `if(typeof $o!="string"||typeof $nw!="string"||$o===""||$nw===""){$ap=!1;break}`
@@ -541,7 +564,7 @@ if (n === 1) { work = work.replace(from, () => to); applied.push(`D new-file vie
 else { console.log(`  HOST: D SKIPPED — anchor x${n} (new-file view highlighting)`); }
 if (eN === 1) { work = work.replace(eFrom, () => eTo); applied.push(`E openFile jump [loc=${e[1]}, ns=${e[8]}]`); }
 else { console.log(`  HOST: E SKIPPED — anchor x${eN} (openFile jump-to-edit)`); }
-if (gN === 1) { work = work.replace(gFrom, () => gTo); applied.push(`G applied-edit diff [fn=${g[1]}, apply=${g[16]}, token=${g[13]}${gNotRead ? `, notRead=${gNotRead[1]}` : ""}]`); }
+if (gN === 1) { work = work.replace(gFrom, () => gTo); applied.push(`G applied-edit diff [fn=${g[1]}, apply=${g[16]}, token=${g[13]}${gNotRead ? `, notRead=${gNotRead[1]}` : ""}${gFs ? `, fs=${gFs[1]}` : ", NO fs: base = document text, may be stale"}]`); }
 else { console.log(`  HOST: G SKIPPED — anchor x${gN} (native diff of an already-applied edit)`); }
 
 fs.writeFileSync(FILE, work);
@@ -625,8 +648,8 @@ for d in "${dirs[@]}"; do
        && grep -qF 'write-preview-scroll' "$css" 2>/dev/null \
        && grep -qF 'expanded-message-unstick' "$css" 2>/dev/null \
        && { [ ! -f "$host" ] || grep -qF '$z=$q.lastIndexOf(".")' "$host" 2>/dev/null; } \
-       && { [ ! -f "$host" ] || grep -qF '$at=$doc.offsetAt(new' "$host" 2>/dev/null; } \
-       && { [ ! -f "$host" ] || grep -qF 'claude-ext-repatch:applied-edit/3' "$host" 2>/dev/null; }; then
+       && { [ ! -f "$host" ] || grep -qF 'if($n===1){$at=$doc.offsetAt(new' "$host" 2>/dev/null; } \
+       && { [ ! -f "$host" ] || grep -qF 'claude-ext-repatch:applied-edit/4' "$host" 2>/dev/null; }; then
       continue  # not `exit`: the other kept build may still need patching
     fi
   fi
