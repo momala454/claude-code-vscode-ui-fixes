@@ -14,10 +14,10 @@ When the Claude Code extension shows tool activity in its panel:
 |---|---------|-----|
 | **A** | A **Write** (new file) preview is clipped to ~2–3 lines with no way to scroll. | Make the Write preview a scrollable, taller box. |
 | **B** | Clicking an **Edit** diff card shows a tiny in-panel diff with no surrounding context. | Clicking it now opens VS Code's **native diff** (real file ↔ file-with-edit), with full context and real line numbers. Falls back to the original in-panel diff when neither side of the edit can be matched in the file. |
-| **C** | Clicking the Edit card's **filename** opens the file at line 1. | The card now sends both sides of the edit, so the jump targets the text that is actually in the file. |
+| **C** | Clicking the Edit card's **filename** looks the edit up by its new text only, so it finds nothing while the edit is still pending. | The card now sends both sides of the edit, so the jump targets whichever one is actually in the file. |
 | **D** | Clicking a **Write** (new file) card opens its content in a separate editor tab with **no syntax highlighting** (everything is plain text). | The new file gets its real extension back so VS Code highlights it. |
-| **E** | …and that filename jump still landed on line 1 anyway: the host looks the text up with a single exact match and does **nothing at all** when it misses — which is most of the time, since the card's "before" text is gone from the file as soon as the edit is applied. | The host now tries both sides of the edit, then falls back to matching the edit's most distinctive line ignoring indentation, so it still lands after the file has been reformatted or re-edited. |
-| **F** | Clicking **"Show more"** on a long message makes it cover the whole rest of the transcript — pinned to the top of the panel, hiding everything after it until you click "Show less" again. A message is a *sticky* header (so you keep seeing your question), and expanding it removes its height cap, so it grows past the viewport while staying pinned. | The message stops being sticky while it is expanded, so the rest of the transcript simply comes after it and you scroll past it normally. |
+| **E** | …and once the file has been reformatted or re-edited since the card, the host's single exact match misses and it does **nothing at all**: the file opens at line 1, or wherever its cursor last was — which can even look like a success. | The host tries both sides of the edit, then falls back to a single line of the edit, ignoring indentation, that still occurs **exactly once** in the file — the inserted text first. It lands on the edit after a reformat, and never on a look-alike line elsewhere; when no line is certain, it does not jump. |
+| **F** | Clicking **"Show more"** on a long message keeps it pinned to the top of the panel while you read the answer below it. A message is a *sticky* header (so you keep seeing your question); expanded, it takes up to 40% of the panel's height, hiding a good part of the answer until you click "Show less" again. | The message stops being sticky while it is expanded, so it scrolls away with the rest of the transcript. Collapsed, it stays sticky as before. |
 | **G** | …and fix B's native diff only ever worked on a **pending** edit. Click a card for an edit that is already applied — which is most of them — and you still got the tiny in-panel diff, because the host builds the diff by re-applying the edit to the file on disk, and the "before" text is gone from it. | For an applied edit the host now reconstructs the file *before* the edit (by applying it in reverse) and diffs that against the real file, so you get full context and the file's own line numbers either way. It only does so when it can place the edit with certainty — `old_string` gone from the file and `new_string` present exactly once — and otherwise leaves the click alone rather than point at a plausible wrong occurrence. |
 
 ### Why patch locally instead of waiting for upstream?
@@ -30,6 +30,52 @@ The matching GitHub issues
 [#65311](https://github.com/anthropics/claude-code/issues/65311))
 were all auto-closed by `github-actions[bot]` as duplicate/stale/not-planned — none
 got human triage. Self-patching is currently the only reliable path.
+
+## Before / after
+
+Each pair was taken on the same build, with `claude-ext-repatch.sh --restore` for the left side
+and the patcher for the right one.
+
+### A — Write preview
+
+The preview of a new file: clipped to a few lines, versus a taller box you can scroll.
+
+| Before | After |
+|---|---|
+| ![A, before: the Write preview is clipped](screenshots/a-before.png) | ![A, after: the Write preview scrolls](screenshots/a-after.png) |
+
+### B + G — Clicking an Edit card
+
+What a click on the diff card of an already-applied edit opens: the small in-panel diff, versus
+VS Code's native diff with the whole file and its own line numbers.
+
+| Before | After |
+|---|---|
+| ![B and G, before: the in-panel diff](screenshots/bg-before.png) | ![B and G, after: the native VS Code diff](screenshots/bg-after.png) |
+
+### C + E — Clicking the filename on an Edit card
+
+A card whose text has been reformatted since: the file opens at line 1, versus on the edited method.
+
+| Before | After |
+|---|---|
+| ![C and E, before: the file opens at line 1](screenshots/ce-before.png) | ![C and E, after: the file opens on the edit](screenshots/ce-after.png) |
+
+### D — Opening a new file from its Write card
+
+The editor tab opened from a Write card: plain text, versus highlighted as its language.
+
+| Before | After |
+|---|---|
+| ![D, before: no syntax highlighting](screenshots/d-before.png) | ![D, after: syntax highlighting](screenshots/d-after.png) |
+
+### F — "Show more" on a long message
+
+Reading a long answer under an expanded message: the message stays pinned over it, versus scrolls away.
+
+| Before | After |
+|---|---|
+| ![F, before: the expanded message covers the transcript](screenshots/f-before.png) | ![F, after: the transcript continues below the message](screenshots/f-after.png) |
 
 ## How it works
 
