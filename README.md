@@ -1,6 +1,6 @@
 # claude-code-vscode-ui-fixes
 
-Local patches for seven UX shortcomings in the **Claude Code VS Code extension**.
+Local patches for eight UX shortcomings in the **Claude Code VS Code extension**.
 
 These are applied to the extension's bundles (webview + host) on *your own machine*.
 The repo contains **only the patch script** — never any of Anthropic's code (see
@@ -19,6 +19,7 @@ When the Claude Code extension shows tool activity in its panel:
 | **E** | …and once the file has been reformatted or re-edited since the card, the host's single exact match misses and it does **nothing at all**: the file opens at line 1, or wherever its cursor last was — which can even look like a success. | The host tries both sides of the edit, then falls back to a single line of the edit, ignoring indentation, that still occurs **exactly once** in the file — the inserted text first. It lands on the edit after a reformat, and never on a look-alike line elsewhere; when no line is certain, it does not jump. |
 | **F** | Clicking **"Show more"** on a long message keeps it pinned to the top of the panel while you read the answer below it. A message is a *sticky* header (so you keep seeing your question); expanded, it takes up to 40% of the panel's height, hiding a good part of the answer until you click "Show less" again. | The message stops being sticky while it is expanded, so it scrolls away with the rest of the transcript. Collapsed, it stays sticky as before. |
 | **G** | …and fix B's native diff only ever worked on a **pending** edit. Click a card for an edit that is already applied — which is most of them — and you still got the tiny in-panel diff, because the host builds the diff by re-applying the edit to the file on disk, and the "before" text is gone from it. | For an applied edit the host now reconstructs the file *before* the edit (by applying it in reverse) and diffs that against the real file, so you get full context and the file's own line numbers either way. It only does so when it can place the edit with certainty — `old_string` gone from the file and `new_string` present exactly once — and otherwise leaves the click alone rather than point at a plausible wrong occurrence. |
+| **H** | A tool card shows only the file's **name**, not its folder, so two files with the same name (a plan written to a temporary folder vs one in your repo) look identical until you click. | Hovering the file name on any card (Edit, Write, Read, Plan, NotebookEdit, sent files) now shows its **full path** as a tooltip. |
 
 ### Why patch locally instead of waiting for upstream?
 
@@ -80,7 +81,7 @@ Reading a long answer under an expanded message: the message stays pinned over i
 ## How it works
 
 The extension ships **minified, closed-source** bundles: the webview
-(`webview/index.{js,css}`, fixes A/B/C/F) and the extension host (`extension.js`,
+(`webview/index.{js,css}`, fixes A/B/C/F/H) and the extension host (`extension.js`,
 fixes D/E/G). Fix B reuses an RPC the extension **already implements** internally
 (`open_diff` → `vscode.diff`) but never wires to the diff card's click. Fix D moves
 the random disambiguator the host appends to a new file's virtual name — from *after*
@@ -114,8 +115,9 @@ The script:
   literally. Argument *positions* are discovered the same way, by reading the callee's own
   signature. If an anchor is missing or ambiguous (e.g. after a big upstream rewrite) it
   **skips that fix and prints `ABORTED`/`SKIPPED`** rather than corrupting the bundle;
-- treats the webview fixes (A/B/C/F) and the host fixes (D/E/G) as **independent** — a
-  failure in one leaves the others applied;
+- treats the webview fixes (A/B/C/F/H) and the host fixes (D/E/G) as **independent** — a
+  failure in one leaves the others applied (B and C go together, as a click handler without
+  its target is worse than none);
 - verifies `node --check` on each patched JS bundle and rolls it back if it somehow
   doesn't parse.
 

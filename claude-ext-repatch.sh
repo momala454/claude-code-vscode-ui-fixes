@@ -56,6 +56,10 @@
 #           as it is now", so reconstruct the before-content by applying the edit REVERSED
 #           and diff that against the real file. Opt-in via a marker diffToken sent by B1,
 #           so the CLI's own open_diff keeps failing as before (it relies on that error).
+#   H (JS)  A card only shows the file's basename, so a same-named file elsewhere (a plan in
+#           the /tmp scratchpad vs the repo) can't be told apart before clicking. Hovering the
+#           name now shows the full path (native title tooltip on the shared file-name link).
+#           Independent of B/C: if either breaks, the other is still applied.
 #
 # Why local patches instead of waiting for upstream: the relevant GitHub issues
 # (#59305, #59078, #3143, #48258, #65311) were all auto-closed by
@@ -283,14 +287,49 @@ for (const e of edits) {
   else { failures.push(`${e.name} (anchor x${n})`); }
 }
 
-if (failures.length) {
-  console.log(`  JS:  ABORTED, no changes written — bundle shape changed. Failed: ${failures.join("; ")}`);
-  process.exit(3); // signal the shell wrapper to leave the file pristine
+// B/C are all-or-nothing among themselves; on failure they are dropped as a unit, but H below
+// does not depend on them and is still applied on the pristine text.
+const bcOk = failures.length === 0;
+if (!bcOk) {
+  console.log(`  JS:  B/C ABORTED, not applied — bundle shape changed. Failed: ${failures.join("; ")}`);
+  work = s;
+}
+
+// H: hovering a card's file name shows the FULL path as a native tooltip. The card only shows
+// the basename, so a file of the same name elsewhere (a plan in the session's /tmp scratchpad
+// vs one in the repo) is indistinguishable until you click it. Every card renders that name
+// through one link component, `({onAction,className,style,children}) => <a href="#">`, which
+// passes no title through; each call site's onAction is `()=>this.opener.open(<path>, ...)`,
+// so the path to show is already the first argument there. Both the component and its call
+// sites are found by source-level names (onAction, opener.open); the component name and the
+// path expressions are captured. Independent of B/C: a break here only loses the tooltip.
+const linkM = s.match(new RegExp(`function (${ID})\\(\\{onAction:(${ID}),className:(${ID}),style:(${ID}),children:(${ID})\\}\\)\\{return (${ID})\\("a",\\{href:"#",className:\\3,style:\\4,`));
+const linkSite = linkM ? new RegExp(`\\(${reEsc(linkM[1])},\\{onAction:\\(\\)=>this\\.opener\\.open\\(([A-Za-z0-9_$.]+)(?=[,)])`, "g") : null;
+const linkSites = linkSite ? work.match(linkSite) || [] : [];
+let hNote;
+if (!linkM || linkSites.length === 0) {
+  hNote = `H SKIPPED — ${!linkM ? "file-name link component" : "its opener.open call sites"} not found (full-path tooltip)`;
+} else if (work.split(linkM[0]).length - 1 !== 1) {
+  hNote = `H SKIPPED — link component anchor x${work.split(linkM[0]).length - 1} (full-path tooltip)`;
+} else {
+  const [whole, fn, onA, cls, sty, kids, jsx] = linkM;
+  work = work.replace(whole, () => `function ${fn}({onAction:${onA},className:${cls},style:${sty},children:${kids},title:$hoverPath}){return ${jsx}("a",{href:"#",className:${cls},style:${sty},title:$hoverPath,`);
+  work = work.replace(linkSite, (_, p) => `(${fn},{title:${p},onAction:()=>this.opener.open(${p}`);
+  hNote = `H full-path tooltip [link=${fn}, ${linkSites.length} call sites]`;
+}
+
+if (!bcOk && hNote.startsWith("H SKIPPED")) {
+  console.log(`  JS:  ${hNote}`);
+  process.exit(3); // nothing applied: signal the shell wrapper to leave the file pristine
 }
 
 fs.writeFileSync(FILE, work);
-console.log(`  JS:  ${edits.length}/${edits.length} edits applied [diff=${diffFn}, edit=${editTag}, click=${clickVar}->${modalFn}]`
-  + (openDiffCall ? "" : "\n  JS:  note — openDiff client signature not recognised, marker not sent (host fix G will stay idle)"));
+console.log(bcOk
+  ? `  JS:  ${edits.length}/${edits.length} B/C edits applied [diff=${diffFn}, edit=${editTag}, click=${clickVar}->${modalFn}]; ${hNote}`
+    + (openDiffCall ? "" : "\n  JS:  note — openDiff client signature not recognised, marker not sent (host fix G will stay idle)")
+  : `  JS:  ${hNote}`);
+// 4 = B/C dropped but H written: the shell keeps the file and still checks its syntax.
+if (!bcOk) process.exit(4);
 NODE
 }
 
@@ -645,6 +684,7 @@ for d in "${dirs[@]}"; do
   # so it stays valid across builds (the old host marker embedded the local `n`).
   if [ "${1:-}" = "--if-needed" ]; then
     if grep -qF 'openDiff:($a,$b)=>' "$js" 2>/dev/null \
+       && grep -qF ',title:$hoverPath}' "$js" 2>/dev/null \
        && grep -qF 'write-preview-scroll' "$css" 2>/dev/null \
        && grep -qF 'expanded-message-unstick' "$css" 2>/dev/null \
        && { [ ! -f "$host" ] || grep -qF '$z=$q.lastIndexOf(".")' "$host" 2>/dev/null; } \
@@ -668,7 +708,10 @@ for d in "${dirs[@]}"; do
   js_rc=0
   js_patch "$js" || js_rc=$?
 
-  if [ "$js_rc" -ne 0 ]; then
+  if [ "$js_rc" -eq 4 ]; then
+    pristine_broken "$js" || true
+  fi
+  if [ "$js_rc" -ne 0 ] && [ "$js_rc" -ne 4 ]; then
     echo "  -> leaving webview bundle PRISTINE (JS patch aborted; CSS not applied)"
     pristine_broken "$js" || true
     cp "$js.orig"  "$js"
