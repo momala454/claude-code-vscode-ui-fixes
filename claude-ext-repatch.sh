@@ -55,7 +55,8 @@
 #           diff. For a card click the diff that matters is "file before the edit" vs "file
 #           as it is now", so reconstruct the before-content by applying the edit REVERSED
 #           and diff that against the real file. Opt-in via a marker diffToken sent by B1,
-#           so the CLI's own open_diff keeps failing as before (it relies on that error).
+#           so the CLI's own open_diff is never diverted; G clears that marker before upstream
+#           runs, because since 2.1.325 a set token changes how upstream handles a miss.
 #   H (JS)  A card only shows the file's basename, so a same-named file elsewhere (a plan in
 #           the /tmp scratchpad vs the repo) can't be told apart before clicking. Hovering the
 #           name now shows the full path (native title tooltip on the shared file-name link).
@@ -177,8 +178,10 @@ let s = fs.readFileSync(FILE, "utf8");
 const ID = "[A-Za-z0-9_$]+";
 const reEsc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, (c) => "\\" + c);
 
-// The fileOpener object: 1..3 = openContent params, 4 = its connection local.
-const openerM = s.match(new RegExp(`openContent:\\((${ID}),(${ID}),(${ID})\\)=>\\{let (${ID})=this\\.comms\\.connection\\.value;if\\(\\4\\)return \\4\\.openContent\\(\\1,\\2,\\3\\);return Promise\\.resolve\\(void 0\\)\\}\\};startNewConversationTab`));
+// The fileOpener object: 1 = openContent's parameter list (forwarded as is), 2 = its connection
+// local. The list is captured whole: 2.1.325 went from 3 parameters to 2 and from
+// `Promise.resolve(void 0)` to `Promise.resolve()`, and only the [0] match is rewritten anyway.
+const openerM = s.match(new RegExp(`openContent:\\(((?:${ID},){0,3}${ID})\\)=>\\{let (${ID})=this\\.comms\\.connection\\.value;if\\(\\2\\)return \\2\\.openContent\\(\\1\\);return Promise\\.resolve\\((?:void 0)?\\)\\}\\};startNewConversationTab`));
 // Diff component: function NAME({original:_,modified:_,language:_="plaintext",filePath:_})
 // `language` is OPTIONAL: 2.1.319 dropped that prop (the component now derives the language
 // from filePath itself), and requiring it is what broke B2/B3/B4 there. Group 4 is then
@@ -221,15 +224,16 @@ const openDiffCall = (() => {
   const args = new Array(Math.max(...idx) + 1).fill("void 0");
   const [iOrig, iNew, iEdits, iMulti, iToken] = idx;
   args[iOrig] = "$a"; args[iNew] = "$a"; args[iEdits] = "$b"; args[iMulti] = "!1";
-  args[iToken] = '"claude-ext-repatch:applied-edit/4"';
+  args[iToken] = '"claude-ext-repatch:applied-edit/5"';
   return `$c.openDiff(${args.join(",")})`;
 })();
 
 const edits = [
-  // The marker goes in the diffToken slot. It carries no meaning to upstream (an unknown
-  // token only ever makes a later accept_diff return false, and we never send one), but it
-  // lets host fix G recognise a click coming from a card and show the before/after diff of
-  // an already-applied edit. Without G the marker is simply ignored.
+  // The marker goes in the diffToken slot, so that host fix G recognises a click coming from a
+  // card and shows the before/after diff of an already-applied edit. G then clears it before
+  // handing over, because upstream is no longer indifferent to a token: since 2.1.325 a set
+  // diffToken switches on its "(edited text only)" fallback (see G). Without G the marker
+  // reaches upstream as is, and a card click on an applied edit opens that fallback diff.
   openerM && { name: "B1 fileOpener +openDiff",
     from: openerM[0],
     to:   openerM[0].replace(/\}\};startNewConversationTab$/, () => `},openDiff:($a,$b)=>{let $c=this.comms.connection.value;if($c)return ${openDiffCall || "$c.openDiff($a,$a,$b,!1)"};return Promise.reject(Error("no connection"))}};startNewConversationTab`) },
@@ -478,7 +482,8 @@ const eN = eFrom === null ? 0 : s.split(eFrom).length - 1;
 // verbatim (that round-trip is what tells an applied edit from a merely similar pending
 // one). Then diff it against the REAL file, so the right-hand side has the file's own line
 // numbers. Strictly opt-in on the marker diffToken B1 sends: the CLI's own open_diff calls
-// keep throwing exactly as today, because the CLI needs that error.
+// are never diverted. 2.1.325 gave the token a meaning upstream (with one set, a miss opens an
+// "(edited text only)" diff instead of throwing), so G clears its own marker after its block.
 //
 // The anchor is the diff helper from its signature through the apply call. Every name in it
 // is minified — the 12 parameters included — so all of them are capture groups. Matching
@@ -488,18 +493,23 @@ const eN = eFrom === null ? 0 : s.split(eFrom).length - 1;
 // from", .Uri.file, .getText(), "leftTempFileProvider.createFile"), not by its layout.
 // 1=fn, 2..13=params (output, leftProvider, rightProvider, originalFilePath, newFilePath,
 // edits, supportMultiEdits, acceptEvent, abortSignal, panelRegistry, channelId, diffToken),
-// 14=the prologue, 15=applied content, 16=the apply function, 17=left content.
+// 14=the prologue, 15=the statement that applies the edits (G is injected right before it),
+// 16=applied content, then the apply function and the left content: 17/18 in the old shape
+// `let S=apply(base,edits),`, 19/20 in the 2.1.325 one `let S,b=o,C;try{S=apply(base,edits)}`,
+// where upstream catches the miss itself and falls back to a diff of the edited text only.
 // The token is the contract between B1 (webview) and G (host), so it carries a REVISION:
 // bump it on every change to either side's logic. It is also what --if-needed greps for, so
 // bumping it is what makes an install patched by an older revision of this script look
 // unpatched and get redone. Without that, a changed injection silently never reaches a
 // machine that only ever runs --if-needed from its login hook.
-const MARK = "claude-ext-repatch:applied-edit/4";
+const MARK = "claude-ext-repatch:applied-edit/5";
 const reEsc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, (c) => "\\" + c);
 const g = s.match(new RegExp(
   `async function (${ID})\\(${Array.from({ length: 12 }, () => `(${ID})`).join(",")}\\)\\{`
   + `((?:(?!async function )[\\s\\S]){0,2500}?)`
-  + `let (${ID})=(${ID})\\((${ID}),\\7\\),`));
+  + `(let (${ID})(?:=(${ID})\\((${ID}),\\7\\),|,[^;{}]*;try\\{\\16=(${ID})\\((${ID}),\\7\\)\\}))`));
+const gApply = g ? (g[17] ?? g[19]) : null;
+const gLc = g ? (g[18] ?? g[20]) : null;
 // Each piece G relies on must be found in the prologue, tied to the captured parameters:
 // the title passed to the "diff from" log, the vscode namespace from Uri.file(originalPath),
 // the left content being the open document's text, the left provider's createFile fallback.
@@ -509,17 +519,17 @@ const g = s.match(new RegExp(
 const gPro = g ? g[14] : "";
 const gTitle = g ? gPro.match(new RegExp(`${reEsc(g[2])}\\.info\\("diff from",${reEsc(g[5])},"to",${reEsc(g[6])},"as",(${ID})\\)`)) : null;
 const gNs = g ? gPro.match(new RegExp(`(${ID})\\.Uri\\.file\\(${reEsc(g[5])}\\)`)) : null;
-const gNotRead = g ? gPro.match(new RegExp(`if\\((${ID})\\)throw ${reEsc(g[17])}=`)) : null;
+const gNotRead = g ? gPro.match(new RegExp(`if\\((${ID})\\)throw ${reEsc(gLc)}=`)) : null;
 // The node fs module, taken from upstream's own dirty-document branch (`b=fs.readFileSync(path,
 // "utf8")`). Optional: without it G falls back to the document text, i.e. to its old behaviour.
 const gFs = g ? gPro.match(new RegExp(`(${ID})\\.readFileSync\\(${reEsc(g[5])},"utf8"\\)`)) : null;
 // The call site proves the first three arguments really are output/left/right provider,
 // hence that the positional reading of the other nine holds. If the shapes ever disagree,
 // skip G rather than inject code reading the wrong parameters.
-const gTail = g ? `let ${g[15]}=${g[16]}(${g[17]},${g[7]}),` : null;
+const gTail = g ? g[15] : null;
 const gOk = !!g && !!gTitle && !!gNs
   && s.includes(`${g[1]}(this.output,this.leftTempFileProvider,this.rightTempFileProvider,`)
-  && new RegExp(`${reEsc(g[17])}=${ID}\\.getText\\(\\)`).test(gPro)
+  && new RegExp(`${reEsc(gLc)}=${ID}\\.getText\\(\\)`).test(gPro)
   && gPro.includes(`${g[2]}.info("leftTempFileProvider.createFile",${g[5]}`)
   && gPro.includes(`${g[3]}.createFile(${g[5]},`)
   && g[0].endsWith(gTail);
@@ -537,7 +547,7 @@ const gTo = gFrom === null ? null : (() => {
   // The right pane stays Uri.file: opening an editor on it makes VS Code reload a clean,
   // stale model from disk, so both panes agree. A read failure keeps upstream's content.
   const lcontent = "$L";
-  const base = `let $L=${g[17]};` + (gFs ? `try{$L=${gFs[1]}.readFileSync(${opath},"utf8")}catch{}` : "");
+  const base = `let $L=${gLc};` + (gFs ? `try{$L=${gFs[1]}.readFileSync(${opath},"utf8")}catch{}` : "");
   // $b = the reconstructed before-content; left pane = a temp doc keyed on the real path
   // (so it keeps the extension, hence the highlighting), right pane = the file itself.
   // Then put the cursor on the first line that differs, so a 2000-line file does not open
@@ -571,8 +581,8 @@ const gTo = gFrom === null ? null : (() => {
     + `if($i!==-1){$ap=!1;break}}`
     + `if($ap){`
     + `let $r=[...${edits}].reverse().map(($x)=>({oldString:$x.newString,newString:$x.oldString,replaceAll:$x.replaceAll})),$b=null;`
-    + `try{$b=${g[16]}(${lcontent},$r)}catch{}`
-    + `if($b!==null&&$b!==${lcontent}){let $ok=!1;try{$ok=${g[16]}($b,${edits})===${lcontent}}catch{}`
+    + `try{$b=${gApply}(${lcontent},$r)}catch{}`
+    + `if($b!==null&&$b!==${lcontent}){let $ok=!1;try{$ok=${gApply}($b,${edits})===${lcontent}}catch{}`
     + `if($ok){let $lu=${lprov}.createFile(${opath},$b).uri,$ru=${ns}.Uri.file(${opath});`
     + `await ${ns}.commands.executeCommand("vscode.diff",$lu,$ru,${title}+" (before ↔ current)",{preview:!1});`
     + `try{let $k=0;while($k<$b.length&&$k<${lcontent}.length&&$b.charCodeAt($k)===${lcontent}.charCodeAt($k))$k++;`
@@ -582,7 +592,14 @@ const gTo = gFrom === null ? null : (() => {
     // matches and the reveal silently never happens. Uri.file() normalises both sides.
     + `if($te&&$te.document.uri.toString()===$ru.toString()){let $pp=new ${ns}.Position($ln,0),$rr=new ${ns}.Range($pp,$pp);`
     + `$te.revealRange($rr,${ns}.TextEditorRevealType.InCenter),$te.selection=new ${ns}.Selection($pp,$pp)}}catch{}`
-    + `return}}}}`;
+    + `return}}}}`
+    // From here on upstream takes over, and it must see the call exactly as it was before B1
+    // added a token: since 2.1.325 a set diffToken turns its "String not found" failure into
+    // a native "(edited text only)" diff with Accept/Reject buttons that do nothing for a card
+    // click, and the promise never rejects, so B3's in-panel fallback never shows. Clearing
+    // OUR token (never the CLI's) restores the old outcome: a pending edit gets upstream's
+    // diff, an edit G declined rejects and the card falls back to the in-panel diff.
+    + `if(${tok}===${JSON.stringify(MARK)})${tok}=void 0;`;
   return gFrom.slice(0, gFrom.length - gTail.length) + inj + gTail;
 })();
 const gN = gFrom === null ? 0 : s.split(gFrom).length - 1;
@@ -603,7 +620,7 @@ if (n === 1) { work = work.replace(from, () => to); applied.push(`D new-file vie
 else { console.log(`  HOST: D SKIPPED — anchor x${n} (new-file view highlighting)`); }
 if (eN === 1) { work = work.replace(eFrom, () => eTo); applied.push(`E openFile jump [loc=${e[1]}, ns=${e[8]}]`); }
 else { console.log(`  HOST: E SKIPPED — anchor x${eN} (openFile jump-to-edit)`); }
-if (gN === 1) { work = work.replace(gFrom, () => gTo); applied.push(`G applied-edit diff [fn=${g[1]}, apply=${g[16]}, token=${g[13]}${gNotRead ? `, notRead=${gNotRead[1]}` : ""}${gFs ? `, fs=${gFs[1]}` : ", NO fs: base = document text, may be stale"}]`); }
+if (gN === 1) { work = work.replace(gFrom, () => gTo); applied.push(`G applied-edit diff [fn=${g[1]}, apply=${gApply}, token=${g[13]}${gNotRead ? `, notRead=${gNotRead[1]}` : ""}${gFs ? `, fs=${gFs[1]}` : ", NO fs: base = document text, may be stale"}]`); }
 else { console.log(`  HOST: G SKIPPED — anchor x${gN} (native diff of an already-applied edit)`); }
 
 fs.writeFileSync(FILE, work);
@@ -689,7 +706,7 @@ for d in "${dirs[@]}"; do
        && grep -qF 'expanded-message-unstick' "$css" 2>/dev/null \
        && { [ ! -f "$host" ] || grep -qF '$z=$q.lastIndexOf(".")' "$host" 2>/dev/null; } \
        && { [ ! -f "$host" ] || grep -qF 'if($n===1){$at=$doc.offsetAt(new' "$host" 2>/dev/null; } \
-       && { [ ! -f "$host" ] || grep -qF 'claude-ext-repatch:applied-edit/4' "$host" 2>/dev/null; }; then
+       && { [ ! -f "$host" ] || grep -qF 'claude-ext-repatch:applied-edit/5' "$host" 2>/dev/null; }; then
       continue  # not `exit`: the other kept build may still need patching
     fi
   fi
@@ -702,9 +719,11 @@ for d in "${dirs[@]}"; do
   cp "$js.orig"  "$js"
   cp "$css.orig" "$css"
 
-  # All-or-nothing: only touch CSS if the JS patch fully succeeded, and verify the
-  # JS parses afterwards. Any failure leaves BOTH files pristine, so we never end up
-  # in a half-patched state (which is worse than unpatched — e.g. a dead click).
+  # The JS is all-or-nothing inside js_patch (B/C as one unit, H on its own) and must
+  # still parse afterwards, else it goes back to pristine — a half-patched JS is worse
+  # than none (e.g. a dead click). The CSS rules A and F depend on none of it: css_patch
+  # only reads the PRISTINE JS to discover class hashes, so it runs whatever the JS did.
+  # It used to be skipped on a JS failure, which since H made A/F hinge on H's anchor.
   js_rc=0
   js_patch "$js" || js_rc=$?
 
@@ -712,19 +731,17 @@ for d in "${dirs[@]}"; do
     pristine_broken "$js" || true
   fi
   if [ "$js_rc" -ne 0 ] && [ "$js_rc" -ne 4 ]; then
-    echo "  -> leaving webview bundle PRISTINE (JS patch aborted; CSS not applied)"
+    echo "  -> leaving webview JS PRISTINE (JS patch aborted)"
     pristine_broken "$js" || true
     cp "$js.orig"  "$js"
-    cp "$css.orig" "$css"
   elif ! node --check "$js" 2>/dev/null; then
     cp "$js.orig"  "$js"
-    cp "$css.orig" "$css"
-    echo "  syntax: FAILED -> rolled back BOTH webview files to pristine"
+    echo "  syntax: FAILED -> rolled back the webview JS to pristine"
     pristine_broken "$js" || true
   else
-    css_patch "$css" "$js.orig"
     echo "  syntax: OK"
   fi
+  css_patch "$css" "$js.orig"
 
   # Fix D (host bundle) — independent of the webview patches above. Back up, re-derive
   # from pristine, patch, verify it parses; roll back this file alone on any failure.
