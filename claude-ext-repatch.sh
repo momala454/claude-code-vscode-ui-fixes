@@ -215,15 +215,18 @@ const modalFn  = clickH ? clickH[2] : null;
 // comes from. Hardcoding "the 7th argument" is the same mistake as hardcoding a minified
 // name, just one level up. If this shape ever changes we fall back to the plain 4-argument
 // call: fix B keeps working, only G's already-applied case goes back to the in-panel diff.
-const clientM = s.match(new RegExp(`async openDiff\\(((?:${ID},){0,12}${ID})\\)\\{return\\(await this\\.sendRequest\\(\\{type:"open_diff",originalFilePath:(${ID}),newFilePath:(${ID}),edits:(${ID}),supportMultiEdits:(${ID}),channelId:(${ID}),diffToken:(${ID})\\}`));
+// supportMultiEdits is optional: 2.1.328 dropped it from the request (and from the host helper).
+const clientM = s.match(new RegExp(`async openDiff\\(((?:${ID},){0,12}${ID})\\)\\{return\\(await this\\.sendRequest\\(\\{type:"open_diff",originalFilePath:(${ID}),newFilePath:(${ID}),edits:(${ID}),(?:supportMultiEdits:(${ID}),)?channelId:(${ID}),diffToken:(${ID})\\}`));
 const openDiffCall = (() => {
   if (!clientM) return null;
   const params = clientM[1].split(",");
-  const idx = [2, 3, 4, 5, 7].map((i) => params.indexOf(clientM[i]));
-  if (idx.includes(-1)) return null;
-  const args = new Array(Math.max(...idx) + 1).fill("void 0");
-  const [iOrig, iNew, iEdits, iMulti, iToken] = idx;
-  args[iOrig] = "$a"; args[iNew] = "$a"; args[iEdits] = "$b"; args[iMulti] = "!1";
+  const idx = [2, 3, 4, 7].map((i) => params.indexOf(clientM[i]));
+  const iMulti = clientM[5] === undefined ? null : params.indexOf(clientM[5]);
+  if (idx.includes(-1) || iMulti === -1) return null;
+  const args = new Array(Math.max(...idx, iMulti ?? 0) + 1).fill("void 0");
+  const [iOrig, iNew, iEdits, iToken] = idx;
+  args[iOrig] = "$a"; args[iNew] = "$a"; args[iEdits] = "$b";
+  if (iMulti !== null) args[iMulti] = "!1";
   args[iToken] = '"claude-ext-repatch:applied-edit/5"';
   return `$c.openDiff(${args.join(",")})`;
 })();
@@ -492,7 +495,10 @@ const eN = eFrom === null ? 0 : s.split(eFrom).length - 1;
 // piece by piece below: what G needs from it is found by its source-level literals ("diff
 // from", .Uri.file, .getText(), "leftTempFileProvider.createFile"), not by its layout.
 // 1=fn, 2..13=params (output, leftProvider, rightProvider, originalFilePath, newFilePath,
-// edits, supportMultiEdits, acceptEvent, abortSignal, panelRegistry, channelId, diffToken),
+// edits, then — before 2.1.328 — supportMultiEdits, acceptEvent, abortSignal, panelRegistry,
+// channelId, diffToken; 2.1.328 dropped supportMultiEdits, so there are 11 and 13 is unset).
+// Only 2..7 are read by position. The diffToken is NOT taken as "the last parameter": it is
+// read from upstream's own `registry?.register(channel??"",uri.toString(),handlers,TOKEN)`.
 // 14=the prologue, 15=the statement that applies the edits (G is injected right before it),
 // 16=applied content, then the apply function and the left content: 17/18 in the old shape
 // `let S=apply(base,edits),`, 19/20 in the 2.1.325 one `let S,b=o,C;try{S=apply(base,edits)}`,
@@ -505,7 +511,7 @@ const eN = eFrom === null ? 0 : s.split(eFrom).length - 1;
 const MARK = "claude-ext-repatch:applied-edit/5";
 const reEsc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, (c) => "\\" + c);
 const g = s.match(new RegExp(
-  `async function (${ID})\\(${Array.from({ length: 12 }, () => `(${ID})`).join(",")}\\)\\{`
+  `async function (${ID})\\(${Array.from({ length: 11 }, () => `(${ID})`).join(",")}(?:,(${ID}))?\\)\\{`
   + `((?:(?!async function )[\\s\\S]){0,2500}?)`
   + `(let (${ID})(?:=(${ID})\\((${ID}),\\7\\),|,[^;{}]*;try\\{\\16=(${ID})\\((${ID}),\\7\\)\\}))`));
 const gApply = g ? (g[17] ?? g[19]) : null;
@@ -527,7 +533,13 @@ const gFs = g ? gPro.match(new RegExp(`(${ID})\\.readFileSync\\(${reEsc(g[5])},"
 // hence that the positional reading of the other nine holds. If the shapes ever disagree,
 // skip G rather than inject code reading the wrong parameters.
 const gTail = g ? g[15] : null;
-const gOk = !!g && !!gTitle && !!gNs
+// The diffToken, from the registry call further down the same function. All three names must
+// be parameters of the helper, and distinct, or the reading is wrong and G stays off.
+const gParams = g ? g.slice(2, 14).filter((p) => p !== undefined) : [];
+const gReg = g ? s.slice(g.index + g[0].length, g.index + g[0].length + 8000)
+  .match(new RegExp(`(${ID})\\?\\.register\\((${ID})\\?\\?"",${ID}\\.toString\\(\\),${ID},(${ID})\\);`)) : null;
+const gTok = gReg && new Set(gReg.slice(1, 4)).size === 3 && gReg.slice(1, 4).every((p) => gParams.includes(p)) ? gReg[3] : null;
+const gOk = !!g && !!gTitle && !!gNs && !!gTok
   && s.includes(`${g[1]}(this.output,this.leftTempFileProvider,this.rightTempFileProvider,`)
   && new RegExp(`${reEsc(gLc)}=${ID}\\.getText\\(\\)`).test(gPro)
   && gPro.includes(`${g[2]}.info("leftTempFileProvider.createFile",${g[5]}`)
@@ -535,7 +547,8 @@ const gOk = !!g && !!gTitle && !!gNs
   && g[0].endsWith(gTail);
 const gFrom = gOk ? g[0] : null;
 const gTo = gFrom === null ? null : (() => {
-  const [, , , lprov, , opath, , edits, , , , , , tok] = g;
+  const [, , , lprov, , opath, , edits] = g;
+  const tok = gTok;
   const title = gTitle[1], ns = gNs[1];
   // Everything below works on $L, the file AS IT IS ON DISK, not on upstream's left content.
   // For a clean document upstream takes the text of the document VS Code has open, and that
@@ -620,7 +633,7 @@ if (n === 1) { work = work.replace(from, () => to); applied.push(`D new-file vie
 else { console.log(`  HOST: D SKIPPED — anchor x${n} (new-file view highlighting)`); }
 if (eN === 1) { work = work.replace(eFrom, () => eTo); applied.push(`E openFile jump [loc=${e[1]}, ns=${e[8]}]`); }
 else { console.log(`  HOST: E SKIPPED — anchor x${eN} (openFile jump-to-edit)`); }
-if (gN === 1) { work = work.replace(gFrom, () => gTo); applied.push(`G applied-edit diff [fn=${g[1]}, apply=${gApply}, token=${g[13]}${gNotRead ? `, notRead=${gNotRead[1]}` : ""}${gFs ? `, fs=${gFs[1]}` : ", NO fs: base = document text, may be stale"}]`); }
+if (gN === 1) { work = work.replace(gFrom, () => gTo); applied.push(`G applied-edit diff [fn=${g[1]}, apply=${gApply}, token=${gTok}${gNotRead ? `, notRead=${gNotRead[1]}` : ""}${gFs ? `, fs=${gFs[1]}` : ", NO fs: base = document text, may be stale"}]`); }
 else { console.log(`  HOST: G SKIPPED — anchor x${gN} (native diff of an already-applied edit)`); }
 
 fs.writeFileSync(FILE, work);
