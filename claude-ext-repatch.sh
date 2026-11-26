@@ -93,7 +93,10 @@ pristine_broken() {
   # Through stdin, not by path: node picks the module format from the file EXTENSION and
   # refuses `.orig` outright (ERR_UNKNOWN_FILE_EXTENSION), which made every pristine backup
   # look corrupt and sent each JS abort down the "reinstall the extension" red herring.
+  # Stdin is parsed as CommonJS, so a bundle with ES-module syntax (2.1.332 lazy-loads Monaco
+  # from its own file) failed here and was reported as corrupt: try it as a module too.
   node --check < "$1.orig" 2>/dev/null && return 1
+  node --check --input-type=module < "$1.orig" 2>/dev/null && return 1
   echo "    NOTE: $(basename "$1") does not parse before any edit of ours ($(stat -c %s "$1.orig") bytes)."
   echo "    That is a corrupt install, not a patch problem — reinstall the extension."
   return 0
@@ -192,8 +195,13 @@ const diffFn = diffM ? diffM[1] : null;
 // the Edit header is `name=<TAG>;header(_,t){return this.fileToolHeader(this.name,t.file_path,{searchText:t.new_string})}`
 const editHdr = s.match(new RegExp(`name=(${ID});header\\((${ID}),(${ID})\\)\\{return this\\.fileToolHeader\\(this\\.name,\\3\\.file_path,\\{searchText:\\3\\.new_string\\}\\)\\}`));
 const editTag = editHdr ? editHdr[1] : null;
-// The Edit body's diff call; 1 = the local holding the tool input.
-const bodyM = diffFn ? s.match(new RegExp(`\\(${reEsc(diffFn)},\\{original:(${ID})\\.old_string\\|\\|"",modified:\\1\\.new_string\\|\\|"",filePath:\\1\\.file_path\\|\\|""\\}\\)`)) : null;
+// The Edit body's diff call; 1 = the local holding the tool input. Since 2.1.332 the body renders
+// a relay that lazy-loads Monaco and then renders the diff component: `function W(e){...;return
+// jsx(<diffFn>,{...e})}`. A relay is accepted only when its single parameter is spread, whole and
+// alone, into the diff component — that is what guarantees B4's onOpenFile still reaches it.
+const relays = diffFn ? [...s.matchAll(new RegExp(`function (${ID})\\((${ID})\\)\\{[\\s\\S]{0,200}?return ${ID}\\(${reEsc(diffFn)},\\{\\.\\.\\.\\2\\}\\)\\}`, "g"))].map((r) => r[1]) : [];
+const bodyCallee = diffFn ? [diffFn, ...relays].map(reEsc).join("|") : null;
+const bodyM = diffFn ? s.match(new RegExp(`\\((?:${bodyCallee}),\\{original:(${ID})\\.old_string\\|\\|"",modified:\\1\\.new_string\\|\\|"",filePath:\\1\\.file_path\\|\\|""\\}\\)`)) : null;
 // The diff component's click overlay calls a modal-open helper. Both the handler var and
 // the helper are minified and rename across releases (was `v=()=>{p(...)}` in older builds,
 // `C=()=>{p(...)}` in 2.1.191), so DISCOVER both instead of hardcoding. The destructured
@@ -332,7 +340,7 @@ if (!bcOk && hNote.startsWith("H SKIPPED")) {
 
 fs.writeFileSync(FILE, work);
 console.log(bcOk
-  ? `  JS:  ${edits.length}/${edits.length} B/C edits applied [diff=${diffFn}, edit=${editTag}, click=${clickVar}->${modalFn}]; ${hNote}`
+  ? `  JS:  ${edits.length}/${edits.length} B/C edits applied [diff=${diffFn}${relays.length ? ` via ${relays.join("/")}` : ""}, edit=${editTag}, click=${clickVar}->${modalFn}]; ${hNote}`
     + (openDiffCall ? "" : "\n  JS:  note — openDiff client signature not recognised, marker not sent (host fix G will stay idle)")
   : `  JS:  ${hNote}`);
 // 4 = B/C dropped but H written: the shell keeps the file and still checks its syntax.
@@ -428,9 +436,17 @@ const ID = "[A-Za-z0-9_$]+";
 // abort (highlighting went back to plaintext). Replace that template literal with an IIFE
 // that inserts the random id before the file extension instead of after it. Our own names
 // are $-prefixed to avoid colliding with the minified locals (e,t,r,i,n,s,o,a,l,u,d,m,v).
+// Since 2.1.332 the same name is built in three locals: `let s=<fileName>||"Claude Code",
+// i=Math.random()...,a=\`${s} (${i})\``. Then only that last template literal is replaced, by
+// an IIFE reading the two locals. Both IIFEs keep the `$z=$q.lastIndexOf(".")` fragment that
+// --if-needed greps for.
 const m = s.match(/`\$\{([A-Za-z0-9_$]+)\|\|"Claude Code"\} \(\$\{Math\.random\(\)\.toString\(36\)\.substring\(2,8\)\}\)`/);
-const from = m ? m[0] : null;
-const to   = m ? `(()=>{let $q=${m[1]}||"Claude Code",$g=Math.random().toString(36).substring(2,8),$z=$q.lastIndexOf(".");return $z>0?$q.slice(0,$z)+" ("+$g+")"+$q.slice($z):$q+" ("+$g+")"})()` : null;
+const dSplit = m ? null : s.match(new RegExp(`(?<![A-Za-z0-9_$])(${ID})=(${ID})\\|\\|"Claude Code",(${ID})=Math\\.random\\(\\)\\.toString\\(36\\)\\.substring\\(2,8\\),${ID}=\`\\$\\{\\1\\} \\(\\$\\{\\3\\}\\)\``));
+const dName = m ? m[1] : dSplit ? dSplit[2] : null;
+const from = m ? m[0] : dSplit ? dSplit[0] : null;
+const to   = m ? `(()=>{let $q=${m[1]}||"Claude Code",$g=Math.random().toString(36).substring(2,8),$z=$q.lastIndexOf(".");return $z>0?$q.slice(0,$z)+" ("+$g+")"+$q.slice($z):$q+" ("+$g+")"})()`
+  : dSplit ? dSplit[0].replace(/`[^`]*`$/, () => `(()=>{let $q=${dSplit[1]},$z=$q.lastIndexOf(".");return $z>0?$q.slice(0,$z)+" ("+${dSplit[3]}+")"+$q.slice($z):$q+" ("+${dSplit[3]}+")"})()`)
+  : null;
 
 const n = from === null ? 0 : s.split(from).length - 1;
 
@@ -629,7 +645,7 @@ if (n !== 1 && eN !== 1 && gN !== 1) {
 
 let work = s;
 const applied = [];
-if (n === 1) { work = work.replace(from, () => to); applied.push(`D new-file view [fileName=${m[1]}]`); }
+if (n === 1) { work = work.replace(from, () => to); applied.push(`D new-file view [fileName=${dName}]`); }
 else { console.log(`  HOST: D SKIPPED — anchor x${n} (new-file view highlighting)`); }
 if (eN === 1) { work = work.replace(eFrom, () => eTo); applied.push(`E openFile jump [loc=${e[1]}, ns=${e[8]}]`); }
 else { console.log(`  HOST: E SKIPPED — anchor x${eN} (openFile jump-to-edit)`); }
